@@ -93,18 +93,18 @@ func writeState(path string, st *state) error {
 		return fmt.Errorf("backup: create a temporary file: %w", err)
 	}
 	tmp := file.Name()
-	defer os.Remove(tmp)
+	defer func() { _ = os.Remove(tmp) }()
 
 	if _, err := file.Write(b); err != nil {
-		file.Close()
+		_ = file.Close()
 		return fmt.Errorf("backup: write %s: %w", tmp, err)
 	}
 	if err := file.Chmod(0o644); err != nil {
-		file.Close()
+		_ = file.Close()
 		return fmt.Errorf("backup: write %s: %w", tmp, err)
 	}
 	if err := file.Sync(); err != nil {
-		file.Close()
+		_ = file.Close()
 		return fmt.Errorf("backup: sync %s: %w", tmp, err)
 	}
 	if err := file.Close(); err != nil {
@@ -122,7 +122,7 @@ func syncDir(path string) error {
 	if err != nil {
 		return fmt.Errorf("backup: open %s: %w", path, err)
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 	if err := d.Sync(); err != nil {
 		return fmt.Errorf("backup: sync %s: %w", path, err)
 	}

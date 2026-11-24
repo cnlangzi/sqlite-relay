@@ -526,7 +526,7 @@ func (sess *sourceSession) sendSnapshot(ctx context.Context) error {
 		sess.sendError(CodeProtocol, "the snapshot failed")
 		return fmt.Errorf("protocol: the snapshot failed: %w", err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	if meta.DatabaseID != segment.DatabaseID(sess.src.cfg.DatabaseID) {
 		sess.sendError(CodeIdentity, "the snapshot belongs to another database")
 		return errors.New("protocol: the snapshot belongs to another database")
