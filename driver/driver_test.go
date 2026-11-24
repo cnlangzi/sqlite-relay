@@ -232,7 +232,11 @@ func TestHookPanicDoesNotFailTheCommit(t *testing.T) {
 	d, _ := newTestDriver(t, Config{})
 	createTable(t, d)
 
-	// A closed channel makes the notification panic inside the hook.
+	// A closed channel makes the notification panic inside the hook. The
+	// loop of the driver notifies as well, so it has to stop before the
+	// channel closes.
+	d.cancel()
+	d.wg.Wait()
 	d.closeEvents()
 
 	if _, err := d.DB().Exec("INSERT INTO t(v) VALUES('boom')"); err != nil {
