@@ -20,6 +20,7 @@ package source
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -36,6 +37,10 @@ const (
 	defaultGCInterval   = 5 * time.Second
 	defaultPeerID       = "backup"
 )
+
+// closeTimeout bounds the time the runtime spends on the chain of the
+// segments when it closes.
+const closeTimeout = 30 * time.Second
 
 // Config configures the primary end of a relay.
 type Config struct {
@@ -154,6 +159,9 @@ type Peer struct {
 	resumePos spool.Pos
 	// resumeSet reports that resumePos belongs to a chain.
 	resumeSet bool
+	// continuityChecked reports that the continuity of the chain was
+	// decided.
+	continuityChecked bool
 
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -311,6 +319,11 @@ func (p *Peer) Stats() Stats {
 
 // Close stops the runtime and releases the spool.
 //
+// The runtime writes the transactions that are still pending into the spool,
+// it publishes the segments and it marks the chain of the segments as
+// complete. The marker tells the next runtime that the chain covers the
+// primary database.
+//
 // The driver is not closed: the application owns it.
 func (p *Peer) Close() error {
 	p.closeOnce.Do(func() {
@@ -319,9 +332,65 @@ func (p *Peer) Close() error {
 		p.cancel()
 		p.wg.Wait()
 		p.runMu.Unlock()
+
+		ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+		defer cancel()
+		if err := p.finishChain(ctx); err != nil {
+			p.setError(err)
+		}
 		_ = p.sp.Close()
 	})
 	return nil
+}
+
+// finishChain writes the transactions that are still pending into the spool
+// and marks the chain of the segments as complete.
+//
+// The marker says that the chain covers the primary database. It is only
+// written when the chain ends where the capture cursor of the driver ends: a
+// chain that ends somewhere else may have a hole.
+func (p *Peer) finishChain(ctx context.Context) error {
+	if err := p.writePending(ctx); err != nil {
+		return err
+	}
+	if err := p.sp.Flush(ctx); err != nil {
+		return err
+	}
+	pending, err := p.sp.Pending()
+	if err != nil {
+		return err
+	}
+	if pending.Due {
+		if err := p.sp.Sync(ctx); err != nil {
+			return err
+		}
+	}
+	ack, err := p.sp.Durable()
+	if err != nil {
+		return err
+	}
+	if ack.Seq == 0 {
+		// The chain is empty: there is nothing to mark and nothing that
+		// could have a hole.
+		return removeMarker(p.markerPath())
+	}
+	cursor := p.drv.Stats().CaptureCursor
+	reason := ""
+	switch {
+	case p.hasPending():
+		reason = "the transactions that did not fit into the spool are not in the chain"
+	case !samePosition(ack.Pos, cursor):
+		reason = "the chain does not end where the driver captured up to"
+	}
+	if reason != "" {
+		// The chain does not cover the primary database: the marker of the
+		// last clean close does not describe the chain any more.
+		if err := removeMarker(p.markerPath()); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: %s", errChainIncomplete, reason)
+	}
+	return writeMarker(p.markerPath(), cleanMarker{Seq: ack.Seq, Pos: markerPosOf(ack.Pos)})
 }
 
 // Suspend stops the capture and waits for the round that is running to end.
@@ -391,4 +460,12 @@ func toDriverPos(pos spool.Pos) driver.Position {
 		Frame:     pos.Frame,
 		WALOffset: pos.WALOffset,
 	}
+}
+
+// samePosition reports whether a position of the spool and a position of the
+// driver name the same frame of the same generation.
+func samePosition(pos spool.Pos, cursor driver.Position) bool {
+	return pos.Salt1 == cursor.Salt1 &&
+		pos.Salt2 == cursor.Salt2 &&
+		pos.Frame == cursor.Frame
 }

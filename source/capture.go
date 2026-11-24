@@ -3,6 +3,7 @@ package source
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 
@@ -55,7 +56,7 @@ func (p *Peer) captureLoop(ctx context.Context) {
 // A chain that the driver could not capture is repaired: the spool starts a
 // new chain and the backup gets a new baseline.
 func (p *Peer) handleRoundError(ctx context.Context, err error) {
-	if errors.Is(err, driver.ErrSnapshotRequired) {
+	if errors.Is(err, driver.ErrSnapshotRequired) || errors.Is(err, errChainBroken) {
 		if rerr := p.recoverChain(ctx, err); rerr != nil {
 			p.setError(rerr)
 		}
@@ -115,6 +116,12 @@ func (p *Peer) round(ctx context.Context) error {
 	if !full {
 		batch, err := p.drv.Scan(ctx)
 		if err != nil {
+			return err
+		}
+		// The chain has to cover the primary database before the increments
+		// of a new generation of the log enter it: a chain with a hole
+		// looks like a chain that continues.
+		if err := p.checkContinuity(); err != nil {
 			return err
 		}
 		rest, err := p.appendTo(ctx, p.transactionsOf(batch.Changes))
@@ -204,6 +211,48 @@ func (p *Peer) holds(pos driver.Position) bool {
 	return pos.Frame <= p.resumePos.Frame
 }
 
+// checkContinuity decides whether the chain of the segments still covers the
+// primary database.
+//
+// The decision is made once: the generations that come after are the business
+// of the driver, it reports the ones it cannot capture. The chain is broken
+// when the log was reset while the runtime was down and the marker of the
+// last clean close does not prove that the chain was complete then.
+func (p *Peer) checkContinuity() error {
+	p.mu.Lock()
+	checked := p.continuityChecked
+	p.mu.Unlock()
+	if checked {
+		return nil
+	}
+
+	ack, err := p.sp.Durable()
+	if err != nil {
+		return err
+	}
+	var marker *cleanMarker
+	if ack.Seq > 0 {
+		marker = readMarker(p.markerPath())
+	}
+	switch judgeChain(ack, p.drv.Stats().Generation, marker) {
+	case verdictUnknown:
+		return nil
+	case verdictContinuous:
+		p.setContinuityChecked()
+		return nil
+	default:
+		return fmt.Errorf("%w: the log was reset and the chain does not prove that it covers the primary database", errChainBroken)
+	}
+}
+
+// setContinuityChecked remembers that the continuity of the chain was
+// decided.
+func (p *Peer) setContinuityChecked() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.continuityChecked = true
+}
+
 // appendTo writes the transactions into the spool.
 //
 // The transactions that were not written are returned: they are written again
@@ -277,6 +326,10 @@ func (p *Peer) recoverChain(ctx context.Context, cause error) error {
 	if err := p.sp.Reset(ctx); err != nil {
 		return err
 	}
+	// The marker describes a chain that is gone.
+	if err := removeMarker(p.markerPath()); err != nil {
+		return err
+	}
 	_, r, err := p.prod.Snapshot(ctx)
 	if err != nil {
 		return err
@@ -295,6 +348,10 @@ func (p *Peer) recoverChain(ctx context.Context, cause error) error {
 	p.snapshotReason = cause.Error()
 	// The acknowledgement of the backup belongs to the chain that is gone.
 	p.backupAckSeq = 0
+	// The position the runtime continued from belongs to the chain that is
+	// gone.
+	p.resumeSet = false
+	p.continuityChecked = false
 	p.mu.Unlock()
 	return nil
 }

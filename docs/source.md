@@ -166,6 +166,46 @@ The segments that were not published when the runtime died are discarded with
 the temporary directory of the spool. Their transactions are captured again
 from the log.
 
+## The restart and the continuity
+
+The chain of the segments has to cover the primary database: a transaction
+that the chain does not hold is a transaction the backup does not get. The
+write-ahead log is reset when the last connection of the primary database
+closes. A reset starts a new generation of the log: the frame numbers start
+over and the transactions that the chain does not hold are gone.
+
+The runtime decides once whether the chain survived the reset. The decision
+waits for the generation of the log: a log that does not exist yet has none.
+
+- The durable acknowledgement of the spool is zero: the chain is empty, the
+  runtime starts a new chain.
+- The generation of the durable acknowledgement is the generation of the log:
+  the log was not reset, the runtime continues where the chain ended.
+- The generation of the log is another one and the marker of the last clean
+  close describes the end of the chain: the log was reset after the runtime
+  closed, the chain was complete then and the reset lost nothing. The chain
+  continues across the generation.
+- The generation of the log is another one and the marker describes another
+  chain or there is none: the chain may have a hole. The runtime resets the
+  chain, it takes a snapshot of the primary database and it tells the backup
+  that it needs a new baseline.
+
+The marker is the file `<root of the spool>/<database id>/peer.json`. It
+holds the sequence number and the position of the end of the chain. The
+runtime writes it when it closes and the chain ends where the capture cursor
+of the driver ends: the chain covers the primary database then. A chain that
+ends somewhere else may have a hole and no marker is written. The marker is
+removed when the chain is reset and when the chain is not complete when the
+runtime closes. The runtime reports a chain that is not complete in its
+statistics.
+
+The order of the shutdown decides whether the chain survives the restart:
+
+1. The business stops writing to the primary database.
+2. The runtime is closed. It writes the transactions that are still pending
+   into the spool, it publishes the segments and it writes the marker.
+3. The driver is closed. The application closes it, the runtime does not.
+
 ## The chain that breaks
 
 The chain is not continuous any more when the log was reset while the driver
@@ -189,6 +229,10 @@ produces one and the backup installs it over the old database.
 The acknowledgement of the backup belongs to the chain it was given in. The
 source does not report the sequence number of a chain that was reset: it
 would collect the segments of the new chain before the backup applied them.
+
+A log that was reset while the runtime was down breaks the chain as well: the
+runtime judges the chain when it starts, see
+[the restart and the continuity](#the-restart-and-the-continuity).
 
 ## The statistics
 
@@ -215,6 +259,13 @@ would collect the segments of the new chain before the backup applied them.
 The driver is the only component that may checkpoint the primary database. A
 connection that checkpoints it behind the back of the driver makes the driver
 fatal: the captured increments cannot be trusted any more.
+
+### Writing to the primary database while the runtime is closed
+
+The chain of the segments has to cover the primary database when the runtime
+closes. A transaction that is committed after the runtime closed is not in
+the chain and the write-ahead log that holds it is reset when the driver
+closes. The runtime cannot see it: the backup needs a new baseline.
 
 ### More than one backup per database
 
