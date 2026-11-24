@@ -7,7 +7,7 @@ GOLANGCI_LINT_PKG := github.com/golangci/golangci-lint/v2/cmd/golangci-lint
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build test test-race bench vet lint fmt fmt-check tools
+.PHONY: help build tests bench vet lint fmt fmt-check tools
 
 help: ## Show the available targets
 	@awk -F':.*## ' '/^[a-z0-9-]+:.*## / && $$1 != "help" { printf "%-12s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -15,10 +15,7 @@ help: ## Show the available targets
 build: ## Compile every package
 	$(GO) build $(PKGS)
 
-test: ## Run the tests (PKGS=./driver/... to scope them)
-	$(GO) test $(PKGS)
-
-test-race: ## Run the tests with the race detector
+tests: ## Run the tests with the race detector (PKGS=./driver/... to scope them)
 	$(GO) test -race $(PKGS)
 
 bench: ## Run the benchmarks
