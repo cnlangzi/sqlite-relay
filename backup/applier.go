@@ -152,7 +152,6 @@ func (a *applier) Apply(ctx context.Context, tx segment.Tx) error {
 			return err
 		}
 		if err := a.waitResumed(ctx); err != nil {
-			a.mu.Unlock()
 			return err
 		}
 	}
@@ -161,16 +160,15 @@ func (a *applier) Apply(ctx context.Context, tx segment.Tx) error {
 // waitResumed waits until the applier is resumed.
 //
 // The caller holds the lock of the applier, the lock is released while the
-// applier waits and held again when it returns.
+// applier waits. The lock is not taken again: the caller takes it when it
+// looks at the state of the applier.
 func (a *applier) waitResumed(ctx context.Context) error {
 	resume := a.resume
 	a.mu.Unlock()
 	select {
 	case <-resume:
-		a.mu.Lock()
 		return nil
 	case <-ctx.Done():
-		a.mu.Lock()
 		return ctx.Err()
 	}
 }
@@ -235,7 +233,6 @@ func (a *applier) Flush(ctx context.Context) error {
 			return err
 		}
 		if err := a.waitResumed(ctx); err != nil {
-			a.mu.Unlock()
 			return err
 		}
 	}
@@ -299,6 +296,9 @@ func (a *applier) NeedsSnapshot() bool {
 // The applier waits for the segment that is applied to end, it makes the
 // applied sequence number durable and it closes the file of the backup
 // database. The file is not touched any more until the applier is resumed.
+//
+// The state of the backup is written before the file is closed: a backup
+// that is killed in between does not open the database again.
 func (a *applier) Pause(ctx context.Context) error {
 	for {
 		a.mu.Lock()
@@ -307,6 +307,11 @@ func (a *applier) Pause(ctx context.Context) error {
 			a.paused = true
 			if a.resume == nil {
 				a.resume = make(chan struct{})
+			}
+			a.st.Paused = true
+			if err := writeState(a.statePath, a.st); err != nil {
+				a.mu.Unlock()
+				return err
 			}
 			err := a.closeFile()
 			a.mu.Unlock()
@@ -328,6 +333,9 @@ func (a *applier) Pause(ctx context.Context) error {
 // the chain it is part of and the size of the file have to match the state
 // of the backup. A business program that still holds the backup database
 // leaves a journal behind, the resume refuses to continue then.
+//
+// The state of the backup is cleared before the file is opened: a backup
+// that is killed in between opens the database again after a restart.
 func (a *applier) Resume(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -341,6 +349,12 @@ func (a *applier) Resume(ctx context.Context) error {
 		if err := a.check(); err != nil {
 			return err
 		}
+		next := *a.st
+		next.Paused = false
+		if err := writeState(a.statePath, &next); err != nil {
+			return err
+		}
+		a.st.Paused = false
 		f, err := os.OpenFile(a.dbPath, os.O_RDWR, 0o644)
 		if err != nil {
 			return fmt.Errorf("backup: open the backup database: %w", err)

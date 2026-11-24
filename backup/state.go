@@ -52,6 +52,9 @@ type state struct {
 	SnapshotBytes uint64 `json:"snapshotBytes"`
 	// SnapshotSHA256 is the checksum of the snapshot of the baseline.
 	SnapshotSHA256 string `json:"snapshotSHA256"`
+	// Paused reports that the backup does not touch its database. The
+	// database belongs to the business until the backup is resumed.
+	Paused bool `json:"paused"`
 }
 
 // readState reads the state file of a backup.
