@@ -91,6 +91,14 @@ A task is done when every acceptance criterion in the task has
 agent believes it is done.
 
 
+### Local scope
+
+- `make test` — every package in the module.
+- `make test PKGS=./driver/...` — only the packages a change touches.
+- `make test-race PKGS=...` — for changes to concurrent code.
+- `make lint` — formatting and golangci-lint; run `make tools` first
+  when the linter is not installed.
+
 ### Process
 
 1. **Before editing**: extract every `Acceptance` / `R*` / `done
@@ -103,8 +111,9 @@ agent believes it is done.
    Phrases like "verified manually" or "looks right" are not
    evidence.
 3. **Blocking checks** before reporting done:
-   - `go build ./...` → exit 0
+   - `make build` → exit 0
    - the scoped test run (see Local scope) → exit 0
+   - `make lint` → exit 0
    - `git diff` reviewed for unrelated changes, debug code,
      weakened tests, and comment drift.
 4. **Failure handling**: if a criterion cannot be satisfied, report
