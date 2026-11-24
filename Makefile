@@ -10,7 +10,7 @@ GOLANGCI_LINT_PKG := github.com/golangci/golangci-lint/v2/cmd/golangci-lint
 .PHONY: help build test test-race bench vet lint fmt fmt-check tools
 
 help: ## Show the available targets
-	@awk -F':.*## ' '/^[a-z-]+:.*## / && $$1 != "help" { printf "%-12s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@awk -F':.*## ' '/^[a-z0-9-]+:.*## / && $$1 != "help" { printf "%-12s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 build: ## Compile every package
 	$(GO) build $(PKGS)
@@ -29,13 +29,15 @@ vet: ## Run go vet
 
 lint: fmt-check ## Check formatting and run golangci-lint
 	@command -v golangci-lint >/dev/null || { echo "golangci-lint not found, run 'make tools'"; exit 1; }
-	golangci-lint run $(PKGS)
+	@pinned=$$($(GO) env GOPATH)/bin/golangci-lint; \
+	if [ -x "$$pinned" ]; then "$$pinned" run $(PKGS); else golangci-lint run $(PKGS); fi
 
 fmt: ## Format every file
 	gofmt -w .
 
 fmt-check: ## Fail when a file is not gofmt clean
-	@files=$$(gofmt -l .); if [ -n "$$files" ]; then echo "gofmt needed:"; echo "$$files"; exit 1; fi
+	@files=$$(gofmt -l .) || { echo "gofmt could not read the tree"; exit 1; }; \
+	if [ -n "$$files" ]; then echo "gofmt needed:"; echo "$$files"; exit 1; fi
 
 tools: ## Install the pinned golangci-lint
 	$(GO) install $(GOLANGCI_LINT_PKG)@$(GOLANGCI_LINT_VERSION)
