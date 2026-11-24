@@ -13,6 +13,11 @@ primary database. The backup side of the protocol receives the segments and
 hands the transactions of them to the sink that applies them, the source
 side receives the segments of a spool and pushes them.
 
+A backup that has no baseline asks for a snapshot in the hello of its
+connection. The source produces one and sends it, the backup installs it and
+the increments of the chain that follow the baseline of the snapshot bring
+the backup up to date.
+
 The transport is TCP. There is no TLS: the deployment is an internal network
 and the shared token is the secret that both sides prove themselves with.
 
@@ -47,9 +52,11 @@ trailer.
 
 | Type | Direction | Payload |
 |---|---|---|
-| `HELLO` | Backup→Source | protocolVersion u32, databaseID 16B, streamID u64, epoch u64, backupID (u16 length + bytes, at most 64), appliedSeq u64, nonce 32B, mac 32B |
+| `HELLO` | Backup→Source | protocolVersion u32, databaseID 16B, streamID u64, epoch u64, needsSnapshot u8, backupID (u16 length + bytes, at most 64), appliedSeq u64, nonce 32B, mac 32B |
 | `HELLO_ACK` | Source→Backup | protocolVersion u32, epoch u64, resumeSeq u64, nonce 32B, mac 32B |
 | `BATCH` | Source→Backup | the segments, each of them with a u32 length that is not zero |
+| `SNAPSHOT_META` | Source→Backup | formatVersion u32, databaseID 16B, streamID u64, epoch u64, baselineSeq u64, pageSize u32, bytes u64, checksum 32B |
+| `SNAPSHOT_DATA` | Source→Backup | the bytes of a part of the file of the snapshot |
 | `ACK` | Backup→Source | appliedSeq u64, epoch u64 |
 | `HEARTBEAT` | both | unixMillis u64 |
 | `FLOW_CONTROL` | Backup→Source | maxUnackedBytes u64 |
@@ -116,6 +123,15 @@ The source checks the following, in this order:
 A check that fails ends the connection. The source does not push a segment to
 a backup that did not prove itself.
 
+The epoch and the applied sequence of the backup come from its sink, not from
+the configuration of the protocol. The two belong together: they are the two
+halves of the position of the backup in the chain.
+
+A hello that asks for a snapshot skips the checks of the epoch and of the
+chain: the backup has no chain yet, there is nothing to compare its epoch and
+its applied sequence with. The snapshot carries the epoch of the chain it is
+bound to and the backup adopts it.
+
 The token is read from its file again for every handshake, so that a token
 that was rotated takes effect without a restart. There is no grace period
 with two tokens: a connection that is open keeps the token it proved itself
@@ -133,6 +149,12 @@ applied it and persisted the applied sequence. The sink is the part that
 writes to the backup database, the protocol only asks it for the sequence
 number it holds.
 
+A sink that makes the applied transactions durable at the boundary of a
+segment implements the `Flusher` interface. The protocol calls it before it
+acknowledges the segment: the acknowledgement means that the transactions up
+to the sequence number it names are applied and that the sequence number is
+persisted.
+
 The boundary of a segment and the boundary of the applied sequence do not
 line up: a resumed connection may start in the middle of a segment. The
 transactions up to the applied sequence are skipped, the rest of the segment
@@ -142,6 +164,34 @@ acknowledged again.
 The acknowledgement of the backup means that the transactions up to the
 sequence number it names are applied and that the sequence number is
 persisted. The source remembers it and calls it `AppliedSeq`.
+
+## The snapshot
+
+A backup without a baseline asks for a snapshot in the hello of its
+connection. The source produces one and sends it: the `SNAPSHOT_META` names
+the database, the generation of the chain, the sequence number of the last
+transaction the snapshot holds, the size of the pages, the size of the file
+and its SHA-256. The `SNAPSHOT_DATA` messages carry the bytes of the file,
+four megabytes at a time. There is no length prefix: the size of the
+payload of the frame is the size of the part.
+
+The bytes of the snapshot are not bound by the window of the backup. The
+window counts the segments of the chain that are in flight, a snapshot is a
+file that is read once from the beginning to the end. The back pressure of
+the transport is enough.
+
+The backup installs the snapshot and acknowledges the baseline sequence of
+the manifest. The source continues with the segments that hold the
+transactions after the baseline.
+
+The manifest is the link between the snapshot and the chain: the increments
+of the chain that follow the baseline bring the database up to date without a
+gap and without a repeat. The backup checks the size and the checksum of the
+file against the manifest, the source checks the database and the epoch of
+the manifest against its own.
+
+A source that cannot produce a snapshot answers with an error. The backup
+does not install anything and the session ends.
 
 ## The resume
 
@@ -194,6 +244,10 @@ connection, it stops sending segments and answers with a `PAUSED` that names
 the last sequence number it sent. `Pause` waits for that answer and it is
 idempotent: a pause that is already running returns without an error.
 
+The backup stops applying the segments as soon as the pause is asked for: the
+batches that arrive while the pause runs are skipped and they are not
+acknowledged. The source sends them again after the resume.
+
 The answer comes from the side that sends the segments: no segment follows
 the `PAUSED`. A caller that pauses before it reads the backup database may
 rely on that.
@@ -226,7 +280,9 @@ applied sequence of the backup: a backup that changes the epoch of its
 applied sequence needs a new snapshot, and a backup that keeps the epoch of a
 snapshot takes the increments of that chain again.
 
-The backup sends the epoch of its applied sequence in the hello. The source
+The backup sends the epoch of its applied sequence in the hello. The epoch
+comes from the sink of the backup, the configuration of the protocol does not
+hold it: the state of the backup is the only place that knows it. The source
 refuses a hello of another generation of the chain with a `RESYNC_REQUIRED`
 that names the epoch of the source. `Backup.Epoch` returns that epoch, so
 that the caller keeps it together with the applied sequence of the sink.
@@ -243,13 +299,18 @@ over.
 
 A backup that needs a new snapshot stops: the run ends with
 `ErrResyncRequired` and the errors of the package can be matched with
-`errors.Is`.
+`errors.Is`. The caller asks for a snapshot in the hello of the next
+connection and the source sends it.
+
+The source keeps serving after a resync. The backup that needs a new
+baseline asks for one in the hello of its next connection, the source sends
+it and the backup installs it over the database it had.
 
 ## The interfaces
 
-The protocol package defines two interfaces. The source side takes the
-segments from a `SegmentSource` and the backup side hands the transactions
-to a `SegmentSink`:
+The protocol package defines the interfaces of the two sides. The source side
+takes the segments from a `SegmentSource` and the backup side hands the
+transactions to a `SegmentSink`:
 
 ```go
 type SegmentSource interface {
@@ -261,6 +322,28 @@ type SegmentSource interface {
 type SegmentSink interface {
 	Apply(ctx context.Context, tx segment.Tx) error
 	AppliedSeq(ctx context.Context) (uint64, error)
+	Epoch() uint64
+}
+```
+
+A sink that makes the applied transactions durable at the boundary of a
+segment implements the `Flusher` interface, a sink that takes a snapshot to
+establish its baseline implements the `SnapshotSink` interface and the source
+that produces the snapshot implements the `SnapshotProvider` interface:
+
+```go
+type Flusher interface {
+	Flush(ctx context.Context) error
+}
+
+type SnapshotSink interface {
+	NeedsSnapshot() bool
+	BeginSnapshot(ctx context.Context, meta SnapshotMeta) (io.Writer, error)
+	CommitSnapshot(ctx context.Context) error
+}
+
+type SnapshotProvider interface {
+	Snapshot(ctx context.Context) (SnapshotMeta, io.ReadCloser, error)
 }
 ```
 
@@ -275,7 +358,7 @@ of the spool is read once and not once per batch.
 The source accepts the connections:
 
 ```go
-src, err := protocol.NewSource(cfg, protocol.NewSpoolSource(sp))
+src, err := protocol.NewSourceWithSnapshot(cfg, protocol.NewSpoolSource(sp), producer)
 err = src.Serve(ctx, listener)
 ```
 
@@ -287,8 +370,7 @@ err = b.Run(ctx, "10.0.0.2:9000")
 ```
 
 `Serve` runs one connection at a time. A connection that failed is ended and
-the next one is accepted. A connection that needs a new snapshot ends the
-serve with `ErrResyncRequired`.
+the next one is accepted.
 
 ## The configuration
 
@@ -298,7 +380,6 @@ serve with `ErrResyncRequired`.
 | `DatabaseID` | | the name of the database the segments belong to |
 | `StreamID` | | the number of the stream |
 | `BackupID` | | the name of the backup, the source checks it against its list |
-| `Epoch` | | the generation of the chain the backup belongs to |
 | `AllowedBackups` | | the backups that may connect, every backup when the list is empty |
 | `HeartbeatInterval` | 5s | the time between two heartbeats |
 | `IdleTimeout` | 30s | the time a connection may stay silent |
@@ -320,14 +401,20 @@ among them are not part of the protocol.
 ### A spool that is broken
 
 A spool whose chain is broken ends the session of every connection: the
-segments of the spool cannot be read. The source keeps accepting, the
-operator resets the spool and takes a new snapshot.
+segments of the spool cannot be read. The source keeps accepting and the
+backup asks for a snapshot when the spool is reset.
 
 ### A backup that is behind the source
 
 The source sends a `RESYNC_REQUIRED` when the backup asks for a sequence
 number that the source cannot provide any more. The protocol does not take
 the snapshot, the peer that owns the snapshot takes it.
+
+### The transfer of a snapshot
+
+The snapshot is transferred in one piece: a transfer that breaks starts over
+with a new snapshot. The source produces the snapshot again for the backup
+that asks for it, so there is no file that has to survive the connection.
 
 ### The data of the segments
 

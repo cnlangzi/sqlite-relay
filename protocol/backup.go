@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net"
 	"sync"
@@ -22,6 +23,10 @@ type Backup struct {
 	cfg  Config
 	sink SegmentSink
 
+	// snapSink is the sink that takes a snapshot. It is nil when the sink
+	// does not implement one.
+	snapSink SnapshotSink
+
 	mu       sync.Mutex
 	sess     *backupSession
 	paused   bool
@@ -30,6 +35,9 @@ type Backup struct {
 
 	// sourceEpoch is the generation of the chain the source is part of.
 	sourceEpoch uint64
+
+	// lastAck is the time of the last acknowledgement the backup sent.
+	lastAck time.Time
 
 	pauseMu sync.Mutex
 }
@@ -43,7 +51,11 @@ func NewBackup(cfg Config, sink SegmentSink) (*Backup, error) {
 	if sink == nil {
 		return nil, errors.New("protocol: the segment sink is nil")
 	}
-	return &Backup{cfg: cfg, sink: sink}, nil
+	b := &Backup{cfg: cfg, sink: sink}
+	if s, ok := sink.(SnapshotSink); ok {
+		b.snapSink = s
+	}
+	return b, nil
 }
 
 // Run dials the source and applies the segments it pushes until the context
@@ -101,11 +113,42 @@ func (b *Backup) setSourceEpoch(epoch uint64) {
 	b.sourceEpoch = epoch
 }
 
+// setLastAck records the time of the last acknowledgement.
+func (b *Backup) setLastAck(t time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.lastAck = t
+}
+
 // LastError returns the error the last connection ended with.
 func (b *Backup) LastError() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.lastErr
+}
+
+// LastAck returns the time of the last acknowledgement the backup sent.
+//
+// It is the time the source received the last sequence number of the backup.
+func (b *Backup) LastAck() time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastAck
+}
+
+// isPaused reports whether the backup is paused.
+func (b *Backup) isPaused() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.paused
+}
+
+// needsSnapshot reports whether the backup asks for a snapshot.
+//
+// A backup without a baseline asks for one, the source sends it instead of
+// the segments of the chain.
+func (b *Backup) needsSnapshot() bool {
+	return b.snapSink != nil && b.snapSink.NeedsSnapshot()
 }
 
 // Pause asks the source to stop pushing segments.
@@ -114,6 +157,10 @@ func (b *Backup) LastError() error {
 // running returns without an error. A pause that is asked for while the
 // backup is not connected is remembered, the source is paused again as soon
 // as the connection is open.
+//
+// The backup stops applying the segments it receives as soon as the pause is
+// asked for: the segments that arrive while the pause runs are skipped and
+// the source sends them again after the resume.
 func (b *Backup) Pause(ctx context.Context, appliedSeq uint64) error {
 	b.pauseMu.Lock()
 	defer b.pauseMu.Unlock()
@@ -123,22 +170,13 @@ func (b *Backup) Pause(ctx context.Context, appliedSeq uint64) error {
 		return nil
 	}
 	sess := b.sess
-	b.mu.Unlock()
-	if sess == nil {
-		b.mu.Lock()
-		b.paused = true
-		b.pauseSeq = appliedSeq
-		b.mu.Unlock()
-		return nil
-	}
-	if err := sess.pause(ctx, appliedSeq); err != nil {
-		return err
-	}
-	b.mu.Lock()
 	b.paused = true
 	b.pauseSeq = appliedSeq
 	b.mu.Unlock()
-	return nil
+	if sess == nil {
+		return nil
+	}
+	return sess.pause(ctx, appliedSeq)
 }
 
 // Resume tells the source to push segments again.
@@ -244,6 +282,14 @@ type backupSession struct {
 	err     error
 	resync  error
 
+	// snapWriter receives the bytes of the snapshot. It is set when the
+	// manifest of the snapshot arrives.
+	snapWriter io.Writer
+	// snapMeta is the manifest of the snapshot that is received.
+	snapMeta SnapshotMeta
+	// snapBytes is the number of bytes of the snapshot that arrived.
+	snapBytes uint64
+
 	cancel   context.CancelFunc
 	once     sync.Once
 	pausedCh chan Paused
@@ -269,7 +315,8 @@ func (sess *backupSession) handshake(ctx context.Context) error {
 		ProtocolVersion: ProtocolVersion,
 		DatabaseID:      segment.DatabaseID(sess.b.cfg.DatabaseID),
 		StreamID:        sess.b.cfg.StreamID,
-		Epoch:           sess.b.cfg.Epoch,
+		Epoch:           sess.b.sink.Epoch(),
+		NeedsSnapshot:   sess.b.needsSnapshot(),
 		BackupID:        sess.b.cfg.BackupID,
 		AppliedSeq:      applied,
 		Nonce:           nonce,
@@ -372,11 +419,28 @@ func (sess *backupSession) readLoop(ctx context.Context) error {
 		}
 		switch t {
 		case MsgBatch:
+			if sess.b.isPaused() {
+				// The backup is paused, the segments that arrive are
+				// skipped. The source sends them again after the resume.
+				continue
+			}
 			m, err := decodeBatch(payload)
 			if err != nil {
 				return err
 			}
 			if err := sess.applyBatch(ctx, m); err != nil {
+				return err
+			}
+		case MsgSnapshotMeta:
+			m, err := decodeSnapshotMeta(payload)
+			if err != nil {
+				return err
+			}
+			if err := sess.beginSnapshot(ctx, m); err != nil {
+				return err
+			}
+		case MsgSnapshotData:
+			if err := sess.writeSnapshotData(ctx, payload); err != nil {
 				return err
 			}
 		case MsgHeartbeat:
@@ -430,12 +494,72 @@ func (sess *backupSession) heartbeatLoop(ctx context.Context) error {
 	}
 }
 
+// beginSnapshot starts the installation of a snapshot.
+//
+// The manifest of the snapshot names the sequence number the snapshot is
+// bound to and the size of its file. The bytes of the file follow in parts.
+func (sess *backupSession) beginSnapshot(ctx context.Context, meta SnapshotMeta) error {
+	if sess.b.snapSink == nil {
+		return fmt.Errorf("%w: the backup does not take a snapshot", ErrInvalidMessage)
+	}
+	w, err := sess.b.snapSink.BeginSnapshot(ctx, meta)
+	if err != nil {
+		return err
+	}
+	sess.mu.Lock()
+	sess.snapWriter = w
+	sess.snapMeta = meta
+	sess.snapBytes = 0
+	sess.mu.Unlock()
+	return nil
+}
+
+// writeSnapshotData writes a part of the file of the snapshot.
+//
+// The snapshot is installed when the last byte of the file arrived. The
+// backup acknowledges the baseline sequence of the snapshot, the source
+// continues with the transactions that follow it.
+func (sess *backupSession) writeSnapshotData(ctx context.Context, data []byte) error {
+	sess.mu.Lock()
+	w := sess.snapWriter
+	sess.mu.Unlock()
+	if w == nil {
+		return fmt.Errorf("%w: the bytes of the snapshot came before its manifest", ErrInvalidMessage)
+	}
+	n, err := w.Write(data)
+	if err != nil {
+		return err
+	}
+	sess.mu.Lock()
+	sess.snapBytes += uint64(n)
+	complete := sess.snapBytes == sess.snapMeta.Bytes
+	sess.mu.Unlock()
+	if !complete {
+		return nil
+	}
+	if err := sess.b.snapSink.CommitSnapshot(ctx); err != nil {
+		return err
+	}
+	sess.mu.Lock()
+	sess.applied = sess.snapMeta.BaselineSeq
+	sess.epoch = sess.snapMeta.Epoch
+	sess.snapWriter = nil
+	sess.mu.Unlock()
+	sess.b.setLastAck(time.Now())
+	return sess.conn.writeMessage(Ack{AppliedSeq: sess.appliedLocked(), Epoch: sess.epochLocked()})
+}
+
 // applyBatch applies the segments of a batch.
 //
 // Every segment is acknowledged when it is applied. A segment that was
-// applied already is acknowledged again without being applied.
+// applied already is acknowledged again without being applied. The backup
+// stops at the segment it is paused at: the segments that follow it are
+// sent again after the resume.
 func (sess *backupSession) applyBatch(ctx context.Context, b Batch) error {
 	for _, raw := range b.Segments {
+		if sess.b.isPaused() {
+			return nil
+		}
 		// The payload of the frame holds the bytes of the segment, the
 		// segment cannot reach into the next one.
 		seg, err := segment.Read(bytes.NewReader(raw))
@@ -455,6 +579,15 @@ func (sess *backupSession) applyBatch(ctx context.Context, b Batch) error {
 		if err != nil {
 			return err
 		}
+		// The transactions of the segment are durable before the backup
+		// acknowledges them: the acknowledgement means that the sequence
+		// number it names is persisted.
+		if f, ok := sess.b.sink.(Flusher); ok {
+			if err := f.Flush(ctx); err != nil {
+				return err
+			}
+		}
+		sess.b.setLastAck(time.Now())
 		if err := sess.conn.writeMessage(Ack{AppliedSeq: applied, Epoch: sess.epochLocked()}); err != nil {
 			return err
 		}

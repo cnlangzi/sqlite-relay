@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/cnlangzi/sqlite-relay/segment"
@@ -60,11 +61,6 @@ type Config struct {
 	// BackupID is the name of the backup. The source checks the name
 	// against the list of the backups that may connect.
 	BackupID string
-	// Epoch is the generation of the chain the backup belongs to. It is
-	// the epoch of the applied sequence of the sink. A backup that
-	// belongs to another generation of the chain is refused by the
-	// source.
-	Epoch uint64
 	// AllowedBackups holds the identifiers of the backups that may connect.
 	// An empty list allows every backup that knows the token.
 	AllowedBackups []string
@@ -176,9 +172,54 @@ type Segment struct {
 // connection may start in the middle of a segment.
 type SegmentSink interface {
 	// Apply applies a transaction. It returns nil when the transaction is
-	// applied and the applied sequence is persisted.
+	// applied. The transactions of a segment are durable when the sink is
+	// flushed, see Flusher.
 	Apply(ctx context.Context, tx segment.Tx) error
 	// AppliedSeq returns the highest sequence number that is applied and
 	// persisted.
 	AppliedSeq(ctx context.Context) (uint64, error)
+	// Epoch returns the generation of the chain the backup is part of. The
+	// epoch of the sink and the epoch of its applied sequence belong
+	// together.
+	Epoch() uint64
+}
+
+// Flusher is implemented by a sink that makes the applied transactions
+// durable at the boundary of a segment.
+//
+// The protocol calls it before it acknowledges a segment: the acknowledgement
+// means that the transactions up to the sequence number it names are applied
+// and that the sequence number is persisted.
+type Flusher interface {
+	// Flush makes the applied transactions durable.
+	Flush(ctx context.Context) error
+}
+
+// SnapshotSink is implemented by a sink that takes a snapshot to establish
+// its baseline.
+//
+// A sink without a baseline asks for a snapshot in its hello. The source
+// answers with the manifest of the snapshot and with its bytes, the sink
+// installs it and the increments of the chain that follow the baseline
+// sequence bring the backup up to date.
+type SnapshotSink interface {
+	// NeedsSnapshot reports whether the sink has no baseline yet.
+	NeedsSnapshot() bool
+	// BeginSnapshot starts the installation of a snapshot. The returned
+	// writer receives the bytes of the snapshot.
+	BeginSnapshot(ctx context.Context, meta SnapshotMeta) (io.Writer, error)
+	// CommitSnapshot finishes the installation of the snapshot.
+	CommitSnapshot(ctx context.Context) error
+}
+
+// SnapshotProvider is implemented by the source of a deployment.
+//
+// The provider produces a consistent snapshot of the primary database and
+// binds it to the sequence number of the last transaction the snapshot
+// holds.
+type SnapshotProvider interface {
+	// Snapshot writes a consistent snapshot of the database and returns its
+	// metadata and a reader of the snapshot. The reader removes the file
+	// when it is closed.
+	Snapshot(ctx context.Context) (SnapshotMeta, io.ReadCloser, error)
 }

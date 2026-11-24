@@ -3,7 +3,10 @@ package protocol
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -96,8 +99,22 @@ func (f *fakeSource) setEpoch(epoch uint64) {
 type fakeSink struct {
 	mu      sync.Mutex
 	applied uint64
+	epoch   uint64
 	txs     []segment.Tx
 	failSeq uint64
+
+	// events records the calls the sink received in the order they
+	// happened.
+	events []string
+
+	// needsSnapshot tells the backup that it has no baseline yet.
+	needsSnapshot bool
+	// snapMeta is the manifest of the snapshot the sink received.
+	snapMeta SnapshotMeta
+	// snapData holds the bytes of the snapshot the sink received.
+	snapData []byte
+	// snapCommitted tells whether the sink committed a snapshot.
+	snapCommitted bool
 }
 
 // Apply applies a transaction.
@@ -114,6 +131,7 @@ func (f *fakeSink) Apply(ctx context.Context, tx segment.Tx) error {
 	}
 	f.txs = append(f.txs, tx)
 	f.applied = tx.Seq
+	f.events = append(f.events, fmt.Sprintf("apply:%d", tx.Seq))
 	return nil
 }
 
@@ -122,6 +140,113 @@ func (f *fakeSink) AppliedSeq(ctx context.Context) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.applied, nil
+}
+
+// Epoch returns the generation of the chain the sink is part of.
+func (f *fakeSink) Epoch() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.epoch
+}
+
+// Flush makes the applied transactions durable.
+func (f *fakeSink) Flush(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, "flush")
+	return nil
+}
+
+// NeedsSnapshot reports whether the sink has no baseline yet.
+func (f *fakeSink) NeedsSnapshot() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.needsSnapshot
+}
+
+// BeginSnapshot starts the installation of a snapshot.
+func (f *fakeSink) BeginSnapshot(ctx context.Context, meta SnapshotMeta) (io.Writer, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snapMeta = meta
+	f.snapData = nil
+	f.events = append(f.events, "begin")
+	return &fakeSnapshotWriter{sink: f}, nil
+}
+
+// CommitSnapshot finishes the installation of the snapshot.
+func (f *fakeSink) CommitSnapshot(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snapCommitted = true
+	f.applied = f.snapMeta.BaselineSeq
+	f.epoch = f.snapMeta.Epoch
+	f.events = append(f.events, "commit")
+	return nil
+}
+
+// record appends an event to the list of the events of the sink.
+func (f *fakeSink) record(event string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, event)
+}
+
+// eventList returns the calls the sink received in the order they happened.
+func (f *fakeSink) eventList() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.events...)
+}
+
+// snapshot returns the manifest and the bytes of the snapshot the sink
+// received.
+func (f *fakeSink) snapshot() (SnapshotMeta, []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.snapMeta, append([]byte(nil), f.snapData...)
+}
+
+// installed reports whether the sink committed a snapshot.
+func (f *fakeSink) installed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.snapCommitted
+}
+
+// fakeSnapshotWriter collects the bytes of a snapshot.
+type fakeSnapshotWriter struct {
+	sink *fakeSink
+}
+
+// Write collects the bytes of the snapshot.
+func (w *fakeSnapshotWriter) Write(p []byte) (int, error) {
+	w.sink.mu.Lock()
+	defer w.sink.mu.Unlock()
+	w.sink.snapData = append(w.sink.snapData, p...)
+	return len(p), nil
+}
+
+// fakeProvider produces the snapshot a source sends to a backup.
+type fakeProvider struct {
+	mu sync.Mutex
+	// meta is the manifest of the snapshot.
+	meta SnapshotMeta
+	// data holds the bytes of the file of the snapshot.
+	data []byte
+	// calls counts the snapshots that were produced.
+	calls int
+}
+
+// Snapshot writes a consistent snapshot of the database.
+func (p *fakeProvider) Snapshot(ctx context.Context) (SnapshotMeta, io.ReadCloser, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	meta := p.meta
+	meta.Bytes = uint64(len(p.data))
+	meta.Checksum = sha256.Sum256(p.data)
+	return meta, io.NopCloser(bytes.NewReader(p.data)), nil
 }
 
 // setApplied sets the sequence number the sink holds.
@@ -203,13 +328,20 @@ func testConfig(t *testing.T) Config {
 // It returns the address of the listener and the error the serve ended with.
 func startSource(t *testing.T, cfg Config, src SegmentSource) (string, *Source, <-chan error) {
 	t.Helper()
+	return startSourceWithSnapshot(t, cfg, src, nil)
+}
+
+// startSourceWithSnapshot starts a source that produces the snapshots of the
+// backups that ask for one.
+func startSourceWithSnapshot(t *testing.T, cfg Config, src SegmentSource, provider SnapshotProvider) (string, *Source, <-chan error) {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	s, err := NewSource(cfg, src)
+	s, err := NewSourceWithSnapshot(cfg, src, provider)
 	if err != nil {
-		t.Fatalf("NewSource: %v", err)
+		t.Fatalf("NewSourceWithSnapshot: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -318,6 +450,10 @@ type testServer struct {
 	conns    []net.Conn
 	received []MessageType
 
+	// sink records the acknowledgements the server receives in the order
+	// the sink applied the transactions.
+	sink *fakeSink
+
 	// closeAfterHello ends the connection right after the hello, it
 	// breaks the connection of the backup.
 	closeAfterHello bool
@@ -408,7 +544,14 @@ func (s *testServer) handle(conn net.Conn) {
 				s.ackList = append(s.ackList, m)
 			}
 		}
+		sink := s.sink
 		s.mu.Unlock()
+		if sink != nil && typ == MsgAck {
+			m, err := decodeAck(payload)
+			if err == nil {
+				sink.record(fmt.Sprintf("ack:%d", m.AppliedSeq))
+			}
+		}
 		if typ == MsgPause {
 			m, err := decodePause(payload)
 			if err != nil {
