@@ -23,7 +23,10 @@ import (
 )
 
 // ProtocolVersion is the version of the protocol this package speaks.
-const ProtocolVersion = 1
+//
+// The version is 2: the hello of the backup carries the flag that asks for a
+// snapshot and the snapshot travels in the messages of the version 2.
+const ProtocolVersion = 2
 
 // Defaults of the configuration.
 const (

@@ -205,7 +205,16 @@ func (p *Producer) snapshotPath() (string, error) {
 // The chain is not continuous any more when the write-ahead log was reset
 // while the snapshot was taken: the snapshot has to be taken again.
 func (p *Producer) drain(ctx context.Context, ack spool.Ack, boundary driver.Position) error {
-	if !after(ack.Pos, boundary) {
+	if ack.Seq == 0 {
+		// The chain is empty, the snapshot is the baseline of the chain
+		// that follows it.
+		return nil
+	}
+	if ack.Pos.Salt1 != boundary.Salt1 || ack.Pos.Salt2 != boundary.Salt2 {
+		return fmt.Errorf("%w: the write-ahead log was reset while the snapshot was taken", errRetry)
+	}
+	if boundary.Frame <= ack.Pos.Frame {
+		// The chain already ends at the boundary of the snapshot.
 		return nil
 	}
 	batch, err := p.drv.ReadChanges(ctx, driver.Position{
@@ -287,16 +296,6 @@ func (p *Producer) meta(ctx context.Context, path string, ack spool.Ack) (protoc
 		Bytes:         uint64(info.Size()),
 		Checksum:      checksum,
 	}, nil
-}
-
-// after reports whether the position b is after the position a.
-//
-// The positions belong to the same generation of the write-ahead log.
-func after(a spool.Pos, b driver.Position) bool {
-	if a.Salt1 != b.Salt1 || a.Salt2 != b.Salt2 {
-		return false
-	}
-	return b.Frame > a.Frame
 }
 
 // snapshotFile is the reader of the file of a snapshot.

@@ -157,3 +157,20 @@ func TestApplierRefusesPagesOfAnotherSize(t *testing.T) {
 		t.Fatal("the applier accepted pages of another size")
 	}
 }
+
+func TestApplierRefusesPagesOutsideTheDatabase(t *testing.T) {
+	dir := t.TempDir()
+	primary := newTestDatabase(t, dir, "primary.db", true)
+	app := newTestApplier(t, dir, "app.db")
+	installSnapshot(t, app, primary, "app.db", 3, 10)
+
+	tx := transaction(t, primary, 11)
+	tx.Pages[0].Pgno = 0
+	if err := app.Apply(context.Background(), tx); err == nil {
+		t.Fatal("the applier accepted the page 0")
+	}
+	tx.Pages[0].Pgno = tx.CommitPages + 1
+	if err := app.Apply(context.Background(), tx); err == nil {
+		t.Fatal("the applier accepted a page beyond the size of the database")
+	}
+}

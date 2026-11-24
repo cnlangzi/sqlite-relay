@@ -73,6 +73,12 @@ func (a *applier) CommitSnapshot(ctx context.Context) error {
 	}
 	a.snap = nil
 	defer s.file.Close()
+	if a.paused {
+		// The business reads the backup database, it may not be replaced
+		// under its feet.
+		os.Remove(s.path)
+		return errors.New("backup: the backup is paused, the snapshot is not installed")
+	}
 
 	if s.bytes != s.meta.Bytes {
 		os.Remove(s.path)
@@ -108,6 +114,14 @@ func (a *applier) CommitSnapshot(ctx context.Context) error {
 			return err
 		}
 	}
+	// The state holds the checksum of the file that is installed. The
+	// header of page 1 was rewritten after the checksum of the manifest
+	// was verified, the file on the disk is not the file the manifest
+	// describes.
+	sum, err := fileChecksum(s.path)
+	if err != nil {
+		return err
+	}
 
 	// The state of the backup is written before the file replaces the
 	// backup database: a backup that was killed during the installation
@@ -119,8 +133,13 @@ func (a *applier) CommitSnapshot(ctx context.Context) error {
 	st.AppliedSeq = s.meta.BaselineSeq
 	st.PageSize = s.meta.PageSize
 	st.SnapshotBytes = s.meta.Bytes
-	st.SnapshotSHA256 = hex.EncodeToString(s.meta.Checksum[:])
+	st.SnapshotSHA256 = hex.EncodeToString(sum)
 	if err := writeState(a.statePath, &st); err != nil {
+		return err
+	}
+	// The file of the old backup database is closed before it is renamed
+	// away: the descriptor of the old file is of no use any more.
+	if err := a.closeFile(); err != nil {
 		return err
 	}
 	if err := os.Rename(s.path, a.dbPath); err != nil {
@@ -139,17 +158,13 @@ func (a *applier) CommitSnapshot(ctx context.Context) error {
 	a.needsSnapshot = false
 	a.snapshotAt = time.Now()
 	a.snapshotBytes = int64(s.meta.Bytes)
+	a.snapshots++
 	a.dirty = false
 	if a.idle != nil {
 		close(a.idle)
 		a.idle = nil
 	}
 
-	if a.paused {
-		// The backup is paused, the file of the backup database stays
-		// closed until the resume.
-		return nil
-	}
 	f, err := os.OpenFile(a.dbPath, os.O_RDWR, 0o644)
 	if err != nil {
 		return fmt.Errorf("backup: open the backup database: %w", err)
@@ -186,7 +201,7 @@ func (w *snapshotWriter) Write(p []byte) (int, error) {
 // snapshot was on its way. The temporary file of the snapshot is the new
 // database when it is still there, the backup database is the new one when
 // the temporary file is gone.
-func recover(dir, dbPath, statePath string, st *state) error {
+func recoverInstall(dir, dbPath, statePath string, st *state) error {
 	if st.Phase != PhaseInstalling {
 		// The temporary file of an installation that was not started is
 		// left over, it is not a database.

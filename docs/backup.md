@@ -66,7 +66,7 @@ time of the write.
 | `pageSize` | the size of the pages of the database |
 | `dbPath` | the path of the file of the backup database |
 | `snapshotBytes` | the size of the snapshot of the baseline |
-| `snapshotSHA256` | the checksum of the snapshot of the baseline |
+| `snapshotSHA256` | the checksum of the file of the backup database |
 
 The epoch of the backup and the applied sequence belong together: they are
 the two halves of the position of the backup in the chain of the source. The
@@ -97,11 +97,15 @@ The installation of a snapshot happens in two steps, so that a backup that
 was killed in the middle of it holds either the old database or the new one:
 
 1. The state file is written with the phase `installing`, the epoch, the
-   baseline and the checksum of the snapshot.
+   baseline and the checksum of the file that is installed.
 2. The file of the snapshot replaces the backup database with a rename and
    the directory is synced.
 3. The state file is written with the phase `ready` and the baseline as the
    applied sequence.
+
+The checksum of the state is the checksum of the file that is installed. The
+header of page 1 is rewritten after the checksum of the manifest was
+verified, so the file on the disk is not the file the manifest describes.
 
 When the backup starts and the state says `installing`, it finishes the
 installation: the temporary file is renamed over the backup database when it
@@ -181,11 +185,25 @@ The rules of the service mode are:
   cannot tell whether a connection of the business is open, it only sees the
   `-journal`, the `-wal` and the `-shm` file of the backup database. A
   leftover journal makes the resume fail with an error that names it.
+- **Close every connection of the business before the relay starts.** The
+  relay writes the file of the backup database as soon as it connects. The
+  same check that the resume runs refuses the start when a journal, a
+  write-ahead log or a shared memory file is next to the backup database.
 - **The backup database is read only.** The business reads it, it does not
   write it. A business that needs to write takes a copy of the file and works
   on the copy: a file that was written by the business may not be resumed
   into the chain of the source, the pages of the backup and the pages of the
   chain would not agree any more.
+
+A pause that the source does not answer still stops the backup: the backup
+does not write its database and the resume puts the source and the backup
+back in sync. The error of the pause tells that the source did not confirm
+it. The segments that arrived while the pause ran are not lost, the source
+sends them again after the resume.
+
+A paused backup does not ask for a snapshot. The business reads the backup
+database and the file may not be replaced under its feet. The backup asks
+for the snapshot when it is resumed.
 
 The connection to the source stays open while the backup is paused. The source
 sees that the backup is paused, it keeps the heartbeat running and it does

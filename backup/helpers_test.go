@@ -188,6 +188,10 @@ type fakeSource struct {
 	mu       sync.Mutex
 	epoch    uint64
 	segments []protocol.Segment
+
+	// block holds the send loop of the source until the channel is
+	// closed. The source does not answer a pause while it is held.
+	block chan struct{}
 }
 
 // Epoch returns the generation of the chain.
@@ -209,6 +213,16 @@ func (f *fakeSource) OldestSeq() uint64 {
 
 // SegmentsAfter returns the segments that hold a transaction after seq.
 func (f *fakeSource) SegmentsAfter(ctx context.Context, seq uint64, limit int64) ([]protocol.Segment, error) {
+	f.mu.Lock()
+	block := f.block
+	f.mu.Unlock()
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []protocol.Segment

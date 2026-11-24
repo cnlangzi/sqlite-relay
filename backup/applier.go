@@ -90,6 +90,8 @@ type applier struct {
 	snapshotAt time.Time
 	// snapshotBytes is the size of the last snapshot that was installed.
 	snapshotBytes int64
+	// snapshots is the number of the snapshots that were installed.
+	snapshots int
 }
 
 // open opens the file of the backup database.
@@ -104,12 +106,33 @@ func (a *applier) open() error {
 	return nil
 }
 
-// snapshotStats returns the time and the size of the last snapshot that was
-// installed.
-func (a *applier) snapshotStats() (time.Time, int64) {
+// check verifies that the file of the backup database belongs to the backup
+// and that nobody else holds it.
+//
+// A journal, a write-ahead log or a shared memory file next to the backup
+// database means that another process has the database open. The relay
+// writes the file of the backup database while it is in sync, a process that
+// reads it at the same time sees a torn page.
+func (a *applier) check() error {
+	for _, name := range []string{"-journal", "-wal", "-shm"} {
+		if _, err := os.Stat(a.dbPath + name); err == nil {
+			return fmt.Errorf("backup: the backup database has a %s file, the connections of the business have to be closed before the relay writes the backup database", name)
+		}
+	}
+	f, err := os.Open(a.dbPath)
+	if err != nil {
+		return fmt.Errorf("backup: open the backup database: %w", err)
+	}
+	defer f.Close()
+	return checkSize(f, a.st.PageSize)
+}
+
+// snapshotStats returns the time, the size and the number of the snapshots
+// that were installed.
+func (a *applier) snapshotStats() (time.Time, int64, int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.snapshotAt, a.snapshotBytes
+	return a.snapshotAt, a.snapshotBytes, a.snapshots
 }
 
 // Apply applies a transaction of the chain.
@@ -128,13 +151,27 @@ func (a *applier) Apply(ctx context.Context, tx segment.Tx) error {
 			a.mu.Unlock()
 			return err
 		}
-		resume := a.resume
-		a.mu.Unlock()
-		select {
-		case <-resume:
-		case <-ctx.Done():
-			return ctx.Err()
+		if err := a.waitResumed(ctx); err != nil {
+			a.mu.Unlock()
+			return err
 		}
+	}
+}
+
+// waitResumed waits until the applier is resumed.
+//
+// The caller holds the lock of the applier, the lock is released while the
+// applier waits and held again when it returns.
+func (a *applier) waitResumed(ctx context.Context) error {
+	resume := a.resume
+	a.mu.Unlock()
+	select {
+	case <-resume:
+		a.mu.Lock()
+		return nil
+	case <-ctx.Done():
+		a.mu.Lock()
+		return ctx.Err()
 	}
 }
 
@@ -161,6 +198,9 @@ func (a *applier) applyTx(tx segment.Tx) error {
 	for _, p := range tx.Pages {
 		if uint32(len(p.Data)) != size {
 			return fmt.Errorf("%w: the page %d holds %d bytes, the page size is %d", ErrPageSize, p.Pgno, len(p.Data), size)
+		}
+		if p.Pgno == 0 || p.Pgno > tx.CommitPages {
+			return fmt.Errorf("backup: the transaction %d holds the page %d, the database has %d pages", tx.Seq, p.Pgno, tx.CommitPages)
 		}
 		offset := int64(p.Pgno-1) * int64(size)
 		if _, err := a.file.WriteAt(p.Data, offset); err != nil {
@@ -194,12 +234,9 @@ func (a *applier) Flush(ctx context.Context) error {
 			a.mu.Unlock()
 			return err
 		}
-		resume := a.resume
-		a.mu.Unlock()
-		select {
-		case <-resume:
-		case <-ctx.Done():
-			return ctx.Err()
+		if err := a.waitResumed(ctx); err != nil {
+			a.mu.Unlock()
+			return err
 		}
 	}
 }
@@ -244,9 +281,16 @@ func (a *applier) Epoch() uint64 {
 }
 
 // NeedsSnapshot reports whether the backup needs a baseline.
+//
+// A paused backup does not ask for a snapshot: the business reads the
+// backup database and the file may not be replaced under its feet. The
+// backup asks for the snapshot when it is resumed.
 func (a *applier) NeedsSnapshot() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.paused {
+		return false
+	}
 	return a.needsSnapshot || a.st.Phase != PhaseReady
 }
 
@@ -261,7 +305,9 @@ func (a *applier) Pause(ctx context.Context) error {
 		if a.idle == nil {
 			// Nothing is in flight, the file is durable.
 			a.paused = true
-			a.resume = make(chan struct{})
+			if a.resume == nil {
+				a.resume = make(chan struct{})
+			}
 			err := a.closeFile()
 			a.mu.Unlock()
 			return err
@@ -292,18 +338,12 @@ func (a *applier) Resume(ctx context.Context) error {
 		if a.epoch != 0 && a.st.Epoch != a.epoch {
 			return fmt.Errorf("backup: the epoch of the backup is %d, the epoch of the source is %d", a.st.Epoch, a.epoch)
 		}
-		for _, name := range []string{"-journal", "-wal", "-shm"} {
-			if _, err := os.Stat(a.dbPath + name); err == nil {
-				return fmt.Errorf("backup: the backup database has a %s file, the connections of the business have to be closed before the resume", name)
-			}
+		if err := a.check(); err != nil {
+			return err
 		}
 		f, err := os.OpenFile(a.dbPath, os.O_RDWR, 0o644)
 		if err != nil {
 			return fmt.Errorf("backup: open the backup database: %w", err)
-		}
-		if err := checkSize(f, a.st.PageSize); err != nil {
-			f.Close()
-			return err
 		}
 		a.file = f
 	}

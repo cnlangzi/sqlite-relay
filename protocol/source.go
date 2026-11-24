@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -270,6 +271,17 @@ func (sess *sourceSession) handshake() error {
 		sess.sendError(CodeProtocol, "the first message is not a hello")
 		return fmt.Errorf("%w: the first message is %s", ErrInvalidFrame, t)
 	}
+	// The version is the first field of the hello. It is read before the
+	// payload is decoded: a peer of another version is told so instead of
+	// getting a hello that does not parse.
+	if len(payload) < 4 {
+		sess.sendError(CodeVersion, "the hello is too short")
+		return fmt.Errorf("%w: the hello is %d bytes", ErrInvalidFrame, len(payload))
+	}
+	if v := binary.BigEndian.Uint32(payload[:4]); v != ProtocolVersion {
+		sess.sendError(CodeVersion, fmt.Sprintf("the protocol version %d is not supported", v))
+		return fmt.Errorf("protocol: the protocol version %d is not supported", v)
+	}
 	hello, err := decodeHello(payload)
 	if err != nil {
 		sess.sendError(CodeProtocol, "the hello is malformed")
@@ -452,6 +464,9 @@ func (sess *sourceSession) sendLoop(ctx context.Context) error {
 			if err := sess.sendSnapshot(ctx); err != nil {
 				return err
 			}
+			// The cursors of the session moved to the baseline of the
+			// snapshot, the loop reads them again.
+			continue
 		}
 
 		// The batch never holds more than the window of the backup
@@ -525,13 +540,20 @@ func (sess *sourceSession) sendSnapshot(ctx context.Context) error {
 	if err := sess.conn.writeMessage(meta); err != nil {
 		return err
 	}
-	buf := make([]byte, snapshotChunkBytes)
+	// A part of the file has to fit into a frame of the peer.
+	chunk := int64(snapshotChunkBytes)
+	if limit := sess.src.cfg.MaxFrameBytes; limit > 0 && limit < chunk {
+		chunk = limit
+	}
+	buf := make([]byte, chunk)
+	var sent uint64
 	for {
 		n, err := r.Read(buf)
 		if n > 0 {
 			if err := sess.conn.writeMessage(SnapshotData{Data: buf[:n]}); err != nil {
 				return err
 			}
+			sent += uint64(n)
 		}
 		if err == io.EOF {
 			break
@@ -540,10 +562,14 @@ func (sess *sourceSession) sendSnapshot(ctx context.Context) error {
 			return fmt.Errorf("protocol: read the snapshot: %w", err)
 		}
 	}
+	if sent != meta.Bytes {
+		return fmt.Errorf("protocol: the snapshot holds %d bytes, the manifest says %d", sent, meta.Bytes)
+	}
 	// The chain continues after the baseline of the snapshot.
 	sess.mu.Lock()
 	sess.sent = meta.BaselineSeq
 	sess.fetched = meta.BaselineSeq
+	sess.applied = meta.BaselineSeq
 	sess.needsSnapshot = false
 	sess.mu.Unlock()
 	return nil

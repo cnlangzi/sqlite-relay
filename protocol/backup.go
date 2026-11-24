@@ -30,6 +30,7 @@ type Backup struct {
 	mu       sync.Mutex
 	sess     *backupSession
 	paused   bool
+	pauseAck bool
 	pauseSeq uint64
 	lastErr  error
 
@@ -161,22 +162,32 @@ func (b *Backup) needsSnapshot() bool {
 // The backup stops applying the segments it receives as soon as the pause is
 // asked for: the segments that arrive while the pause runs are skipped and
 // the source sends them again after the resume.
+//
+// A pause that the source does not answer leaves the backup paused. The
+// segments that were skipped are sent again after the resume, the backup
+// does not lose them.
 func (b *Backup) Pause(ctx context.Context, appliedSeq uint64) error {
 	b.pauseMu.Lock()
 	defer b.pauseMu.Unlock()
 	b.mu.Lock()
-	if b.paused {
+	sess := b.sess
+	if b.paused && b.pauseAck {
 		b.mu.Unlock()
 		return nil
 	}
-	sess := b.sess
 	b.paused = true
 	b.pauseSeq = appliedSeq
 	b.mu.Unlock()
 	if sess == nil {
 		return nil
 	}
-	return sess.pause(ctx, appliedSeq)
+	if err := sess.pause(ctx, appliedSeq); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	b.pauseAck = true
+	b.mu.Unlock()
+	return nil
 }
 
 // Resume tells the source to push segments again.
@@ -190,6 +201,7 @@ func (b *Backup) Resume(ctx context.Context, appliedSeq uint64) error {
 	b.mu.Lock()
 	sess := b.sess
 	b.paused = false
+	b.pauseAck = false
 	b.pauseSeq = appliedSeq
 	b.mu.Unlock()
 	if sess == nil {
@@ -252,6 +264,10 @@ func (b *Backup) runSession(ctx context.Context, addr string) (bool, error) {
 	if paused {
 		if err := sess.pause(sctx, pauseSeq); err != nil {
 			sess.finish(err)
+		} else {
+			sess.b.mu.Lock()
+			sess.b.pauseAck = true
+			sess.b.mu.Unlock()
 		}
 	}
 

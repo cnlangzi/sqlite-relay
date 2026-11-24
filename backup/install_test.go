@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestInstallRefusesASnapshotThatDoesNotMatchTheManifest(t *testing.T) {
@@ -167,6 +168,31 @@ func TestOpenRefusesAnInstallationThatDidNotFinish(t *testing.T) {
 	}
 }
 
+func TestInstallRefusesTheSnapshotOfAPausedBackup(t *testing.T) {
+	dir := t.TempDir()
+	primary := newTestDatabase(t, dir, "primary.db", true)
+	app := newTestApplier(t, dir, "app.db")
+	installSnapshot(t, app, primary, "app.db", 3, 10)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := app.Pause(ctx); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	meta := snapshotMeta(t, primary, "app.db", 3, 20)
+	w, err := app.BeginSnapshot(ctx, meta)
+	if err != nil {
+		t.Fatalf("BeginSnapshot: %v", err)
+	}
+	b := mustRead(t, primary)
+	if _, err := w.Write(b); err != nil {
+		t.Fatalf("write the snapshot: %v", err)
+	}
+	if err := app.CommitSnapshot(ctx); err == nil {
+		t.Fatal("the backup installed a snapshot while it was paused")
+	}
+}
+
 func TestInstallTakesTheEpochOfTheSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	primary := newTestDatabase(t, dir, "primary.db", true)
@@ -185,5 +211,48 @@ func TestInstallTakesTheEpochOfTheSnapshot(t *testing.T) {
 	}
 	if app.NeedsSnapshot() {
 		t.Error("the backup asks for a snapshot, it has a baseline")
+	}
+}
+
+// TestOpenRecoversAnInstallationWhoseRenameHappened installs a snapshot the
+// way the relay does it and then pretends that the process was killed
+// between the rename and the state that says the installation is done.
+func TestOpenRecoversAnInstallationWhoseRenameHappened(t *testing.T) {
+	dir := t.TempDir()
+	root := t.TempDir()
+	primary := newTestDatabase(t, dir, "primary.db", true)
+
+	backupDir := filepath.Join(root, "app.db")
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		t.Fatalf("create the directory: %v", err)
+	}
+	app := &applier{
+		dir:       backupDir,
+		dbPath:    filepath.Join(backupDir, dbName),
+		statePath: filepath.Join(backupDir, stateName),
+		st: &state{
+			Version:    stateVersion,
+			Phase:      PhaseEmpty,
+			DatabaseID: "app.db",
+			StreamID:   1,
+			DBPath:     filepath.Join(backupDir, dbName),
+		},
+	}
+	installSnapshot(t, app, primary, "app.db", 3, 10)
+
+	// The process was killed between the rename and the state that says
+	// the installation is done.
+	st, err := readState(app.statePath)
+	if err != nil {
+		t.Fatalf("readState: %v", err)
+	}
+	st.Phase = PhaseInstalling
+	if err := writeState(app.statePath, st); err != nil {
+		t.Fatalf("writeState: %v", err)
+	}
+
+	cfg := testConfig(t, root)
+	if _, err := Open(context.Background(), cfg); err != nil {
+		t.Fatalf("Open: %v", err)
 	}
 }

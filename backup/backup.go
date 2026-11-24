@@ -148,7 +148,7 @@ func Open(ctx context.Context, cfg Config) (*Peer, error) {
 	if st.DatabaseID != "" && st.DatabaseID != cfg.Protocol.DatabaseID {
 		return nil, fmt.Errorf("backup: the directory holds the backup of the database %q", st.DatabaseID)
 	}
-	if err := recover(dir, dbPath, statePath, st); err != nil {
+	if err := recoverInstall(dir, dbPath, statePath, st); err != nil {
 		return nil, err
 	}
 
@@ -162,6 +162,11 @@ func Open(ctx context.Context, cfg Config) (*Peer, error) {
 		pending:   st.AppliedSeq,
 	}
 	if st.Phase == PhaseReady {
+		// The relay writes the file of the backup database while it is in
+		// sync. The file may not be in use by another process.
+		if err := app.check(); err != nil {
+			return nil, err
+		}
 		if err := app.open(); err != nil {
 			return nil, err
 		}
@@ -179,6 +184,7 @@ func Open(ctx context.Context, cfg Config) (*Peer, error) {
 // more does not end the run: the peer asks for a new snapshot and it opens
 // the connection again.
 func (p *Peer) Run(ctx context.Context, addr string) error {
+	attempt := 0
 	for {
 		err := p.proto.Run(ctx, addr)
 		if ctx.Err() != nil {
@@ -188,9 +194,10 @@ func (p *Peer) Run(ctx context.Context, addr string) error {
 			p.requireSnapshot(err)
 			// The connection is opened again after a delay: the chain of
 			// the source may not be continuous yet.
-			if err := sleep(ctx, p.backoff()); err != nil {
+			if err := sleep(ctx, p.backoff(attempt)); err != nil {
 				return err
 			}
+			attempt++
 			continue
 		}
 		return err
@@ -198,10 +205,24 @@ func (p *Peer) Run(ctx context.Context, addr string) error {
 }
 
 // backoff returns the delay before the next connection attempt.
-func (p *Peer) backoff() time.Duration {
-	d := p.cfg.Protocol.BackoffMin
-	if d <= 0 {
-		d = time.Second
+//
+// The delay grows with every attempt and stops at the maximum of the
+// configuration: a chain that is broken is not hammered with connections.
+func (p *Peer) backoff(attempt int) time.Duration {
+	min := p.cfg.Protocol.BackoffMin
+	if min <= 0 {
+		min = time.Second
+	}
+	max := p.cfg.Protocol.BackoffMax
+	if max < min {
+		max = min
+	}
+	d := min
+	for i := 0; i < attempt && d < max; i++ {
+		d *= 2
+	}
+	if d > max {
+		d = max
 	}
 	return d
 }
@@ -225,30 +246,27 @@ func sleep(ctx context.Context, d time.Duration) error {
 // the file of the backup database is closed. The backup database is not
 // touched any more when the call returns.
 //
-// A pause that is already running returns without an error.
+// A pause that the source does not answer still stops the backup: the backup
+// does not write its database and the resume puts the source and the backup
+// back in sync. The error tells that the source did not confirm the pause.
 func (p *Peer) Pause(ctx context.Context) error {
-	p.mu.Lock()
-	if p.paused {
-		p.mu.Unlock()
-		return nil
-	}
-	p.mu.Unlock()
-
 	applied, err := p.app.AppliedSeq(ctx)
 	if err != nil {
 		return err
 	}
-	if err := p.proto.Pause(ctx, applied); err != nil {
-		p.setError(err)
-		return err
-	}
-	if err := p.app.Pause(ctx); err != nil {
-		p.setError(err)
-		return err
-	}
+	perr := p.proto.Pause(ctx, applied)
+	aerr := p.app.Pause(ctx)
 	p.mu.Lock()
 	p.paused = true
 	p.mu.Unlock()
+	if perr != nil {
+		p.setError(perr)
+		return perr
+	}
+	if aerr != nil {
+		p.setError(aerr)
+		return aerr
+	}
 	return nil
 }
 
@@ -310,7 +328,7 @@ func (p *Peer) Stats() Stats {
 		}
 	}
 
-	st.LastSnapshot, st.LastSnapshotBytes = p.app.snapshotStats()
+	st.LastSnapshot, st.LastSnapshotBytes, st.Snapshots = p.app.snapshotStats()
 	applied, err := p.app.AppliedSeq(context.Background())
 	if err == nil {
 		st.AppliedSeq = applied

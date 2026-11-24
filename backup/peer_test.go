@@ -202,6 +202,39 @@ func TestPeerAsksForANewSnapshotWhenTheChainIsBroken(t *testing.T) {
 	}
 }
 
+func TestPeerStaysResumableWhenTheSourceDoesNotAnswerThePause(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+	primary := newTestDatabase(t, t.TempDir(), "primary.db", true)
+
+	src := &fakeSource{epoch: 3, block: make(chan struct{})}
+	t.Cleanup(func() { close(src.block) })
+	provider := testSnapshotProvider(t, primary, cfg.Protocol.DatabaseID, 3, 10)
+	addr := startSource(t, cfg, src, provider)
+	p := startPeer(t, cfg, addr)
+	if !waitFor(t, func() bool { return p.Stats().AppliedSeq == 10 }) {
+		t.Fatalf("the backup applied the sequence number %d, want the baseline 10", p.Stats().AppliedSeq)
+	}
+
+	// The source does not answer the pause: its send loop is held.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := p.Pause(ctx); err == nil {
+		t.Fatal("the pause did not fail although the source did not answer")
+	}
+	// The backup is paused and it can be resumed: the resume puts the
+	// source and the backup back in sync.
+	if p.Stats().State != StatePaused {
+		t.Errorf("the state of the backup is %q, want %q", p.Stats().State, StatePaused)
+	}
+	if err := p.Resume(context.Background()); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if p.Stats().State != StateSyncing {
+		t.Errorf("the state of the backup is %q, want %q", p.Stats().State, StateSyncing)
+	}
+}
+
 func TestPeerRefusesToResumeWhileTheBusinessHoldsTheDatabase(t *testing.T) {
 	root := t.TempDir()
 	cfg := testConfig(t, root)
