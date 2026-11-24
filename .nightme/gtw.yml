@@ -1,0 +1,9 @@
+mode: remote
+issue: 10
+branch: 10-feat-driver-add-sqlite-wal-capture-driver-with-checkpoint-barrier
+worktree: /home/devin/code/sqlite-relay.nightme/10-feat-driver-add-sqlite-wal-capture-driver-with-checkpoint-barrier
+repoRoot: /home/devin/code/sqlite-relay
+repo: cnlangzi/sqlite-relay
+provider: github
+initialHead: 61a4236f44be381ea2f3b471cbb8977ff2112abd
+createdAt: 2026-11-24T02:34:47.089454005Z
