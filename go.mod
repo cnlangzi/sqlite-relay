@@ -1,6 +1,6 @@
 module github.com/cnlangzi/sqlite-relay
 
-go 1.24
+go 1.27
 
 // The WAL hook lives in a fork of mattn/go-sqlite3 until the upstream patch
 // (PR #1353) is merged. The import path stays github.com/mattn/go-sqlite3 so
