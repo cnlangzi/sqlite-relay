@@ -33,15 +33,26 @@ func startSource(t *testing.T, cfg Config, src protocol.SegmentSource, provider 
 }
 
 // startPeer opens a backup and lets it run.
+//
+// The cleanup waits for the peer to stop: the peer writes into its
+// directory, the removal of the directory must not race with it.
 func startPeer(t *testing.T, cfg Config, addr string) *Peer {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
 	p, err := Open(ctx, cfg)
 	if err != nil {
+		cancel()
 		t.Fatalf("Open: %v", err)
 	}
-	go p.Run(ctx, addr)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.Run(ctx, addr)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
 	return p
 }
 
@@ -190,8 +201,9 @@ func TestPeerAsksForANewSnapshotWhenTheChainIsBroken(t *testing.T) {
 	seg := testSegment(t, cfg.Protocol.DatabaseID, 5, 21, tx)
 	src.add(protocol.Segment{SeqStart: 21, SeqEnd: 21, Epoch: 5, Bytes: seg})
 
-	// The backup takes the new baseline.
-	if !waitFor(t, func() bool { return p.Stats().AppliedSeq == 20 }) {
+	// The backup takes the new baseline. The segment that follows it may
+	// already be applied when the baseline is noticed.
+	if !waitFor(t, func() bool { return p.Stats().AppliedSeq >= 20 }) {
 		t.Fatalf("the backup applied the sequence number %d, want the baseline 20", p.Stats().AppliedSeq)
 	}
 	if p.Stats().Epoch != 5 {
@@ -232,6 +244,113 @@ func TestPeerStaysResumableWhenTheSourceDoesNotAnswerThePause(t *testing.T) {
 	}
 	if p.Stats().State != StateSyncing {
 		t.Errorf("the state of the backup is %q, want %q", p.Stats().State, StateSyncing)
+	}
+}
+
+// TestPeerKeepsThePauseAcrossARestart checks that a backup that was paused
+// does not touch its database after a restart.
+//
+// The database belongs to the business while the backup is paused: the relay
+// may not write it, it may not open it and it may not fail because of the
+// files the business leaves behind.
+func TestPeerKeepsThePauseAcrossARestart(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+	primary := newTestDatabase(t, t.TempDir(), "primary.db", true)
+
+	src := &fakeSource{epoch: 3}
+	provider := testSnapshotProvider(t, primary, cfg.Protocol.DatabaseID, 3, 10)
+	addr := startSource(t, cfg, src, provider)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	go p.Run(ctx, addr)
+	if !waitFor(t, func() bool { return p.Stats().AppliedSeq == 10 }) {
+		t.Fatalf("the backup applied the sequence number %d, want the baseline 10", p.Stats().AppliedSeq)
+	}
+
+	pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer pauseCancel()
+	if err := p.Pause(pauseCtx); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if p.Stats().State != StatePaused {
+		t.Errorf("the state of the backup is %q, want %q", p.Stats().State, StatePaused)
+	}
+
+	backup := filepath.Join(root, cfg.Protocol.DatabaseID, dbName)
+	before, err := os.Stat(backup)
+	if err != nil {
+		t.Fatalf("stat the backup: %v", err)
+	}
+	sum := checksum(t, backup)
+
+	// The business opens the backup database and leaves a journal behind.
+	if err := os.WriteFile(backup+"-journal", []byte("the journal of the business"), 0o644); err != nil {
+		t.Fatalf("write the journal: %v", err)
+	}
+
+	// The process dies and starts again.
+	cancel()
+
+	p2, err := Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if p2.Stats().State != StatePaused {
+		t.Errorf("the state of the backup is %q, want %q", p2.Stats().State, StatePaused)
+	}
+	after, err := os.Stat(backup)
+	if err != nil {
+		t.Fatalf("stat the backup: %v", err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Error("the backup database was written while the backup was paused")
+	}
+	if checksum(t, backup) != sum {
+		t.Error("the content of the backup database changed while the backup was paused")
+	}
+
+	// The backup starts again and tells the source about the pause.
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	go p2.Run(runCtx, addr)
+
+	// The source stops asking for the segments when the pause is active.
+	calls := waitForStable(t, src.callCount)
+
+	// The source does not push the segments of the chain any more.
+	write(t, primary, "second")
+	tx := transaction(t, primary, 11)
+	seg := testSegment(t, cfg.Protocol.DatabaseID, 3, 11, tx)
+	src.add(protocol.Segment{SeqStart: 11, SeqEnd: 11, Epoch: 3, Bytes: seg})
+	time.Sleep(500 * time.Millisecond)
+	if got := src.callCount(); got != calls {
+		t.Errorf("the source asked for the segments %d times, want %d", got, calls)
+	}
+	if p2.Stats().AppliedSeq != 10 {
+		t.Errorf("the backup applied the sequence number %d, want 10", p2.Stats().AppliedSeq)
+	}
+
+	// The business closes the backup database again.
+	if err := os.Remove(backup + "-journal"); err != nil {
+		t.Fatalf("remove the journal: %v", err)
+	}
+	if err := p2.Resume(pauseCtx); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if p2.Stats().State != StateSyncing {
+		t.Errorf("the state of the backup is %q, want %q", p2.Stats().State, StateSyncing)
+	}
+	if !waitFor(t, func() bool { return p2.Stats().AppliedSeq == 11 }) {
+		t.Fatalf("the backup applied the sequence number %d, want 11", p2.Stats().AppliedSeq)
+	}
+	if rows := query(t, backup); len(rows) != 2 {
+		t.Errorf("the backup holds %v, want the rows of the primary", rows)
 	}
 }
 

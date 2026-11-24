@@ -189,9 +189,20 @@ type fakeSource struct {
 	epoch    uint64
 	segments []protocol.Segment
 
+	// calls is the number of times the source asked for the segments. A
+	// source that is paused does not ask for them.
+	calls int
+
 	// block holds the send loop of the source until the channel is
 	// closed. The source does not answer a pause while it is held.
 	block chan struct{}
+}
+
+// callCount returns the number of times the source asked for the segments.
+func (f *fakeSource) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 // Epoch returns the generation of the chain.
@@ -214,6 +225,7 @@ func (f *fakeSource) OldestSeq() uint64 {
 // SegmentsAfter returns the segments that hold a transaction after seq.
 func (f *fakeSource) SegmentsAfter(ctx context.Context, seq uint64, limit int64) ([]protocol.Segment, error) {
 	f.mu.Lock()
+	f.calls++
 	block := f.block
 	f.mu.Unlock()
 	if block != nil {
@@ -374,4 +386,24 @@ func waitFor(t *testing.T, cond func() bool) bool {
 		time.Sleep(5 * time.Millisecond)
 	}
 	return cond()
+}
+
+// waitForStable waits until the value does not change any more and returns
+// it.
+//
+// The source of the protocol asks for the segments of the chain in a loop.
+// The count of the calls grows until the source is paused.
+func waitForStable(t *testing.T, count func() int) int {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	last := count()
+	for time.Now().Before(deadline) {
+		time.Sleep(60 * time.Millisecond)
+		current := count()
+		if current == last {
+			return current
+		}
+		last = current
+	}
+	return last
 }

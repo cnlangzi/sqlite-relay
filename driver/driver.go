@@ -24,6 +24,14 @@ import (
 	"github.com/cnlangzi/sqlite-relay/internal/wal"
 )
 
+// ErrSnapshotRequired reports that the increments of the primary database
+// are not continuous any more.
+//
+// The consumer cannot close the gap with the increments of the log, it needs
+// a new snapshot of the primary database as the baseline of the chain that
+// follows it.
+var ErrSnapshotRequired = errors.New("driver: a new snapshot is required")
+
 // Config configures a Driver.
 type Config struct {
 	// DSN is the mattn DSN of the primary database.
@@ -120,6 +128,7 @@ type Driver struct {
 	cursor        Position
 	cursorSet     bool
 	walBoundary   uint64
+	startFrames   uint64
 	ack           Position
 	ackSet        bool
 	backfillFence int
@@ -306,8 +315,10 @@ func (d *Driver) CaptureAck(_ context.Context, pos Position) error {
 		// nothing about the frames of the current one.
 		return nil
 	}
-	if d.ackSet && pos.Frame <= d.ack.Frame {
-		// An acknowledgement never goes back.
+	if d.ackSet && d.ack.sameGeneration(pos) && pos.Frame <= d.ack.Frame {
+		// An acknowledgement never goes back. The frames of two
+		// generations are counted apart, an acknowledgement of a new
+		// generation is not a step back.
 		return nil
 	}
 	d.ack = pos
@@ -524,7 +535,7 @@ func (d *Driver) recover() error {
 	if d.cfg.ResumePosition != nil {
 		pos := *d.cfg.ResumePosition
 		if !pos.sameGeneration(Position{Salt1: hdr.Salt1, Salt2: hdr.Salt2}) {
-			return fmt.Errorf("driver: the WAL was reset, the position %s does not belong to the current generation, a new snapshot is needed", pos)
+			return fmt.Errorf("%w: the WAL was reset, the position %s does not belong to the current generation", ErrSnapshotRequired, pos)
 		}
 		if err := reader.RewindTo(pos.Frame + 1); err != nil {
 			return fmt.Errorf("driver: resume at %s: %w", pos, err)
@@ -540,9 +551,18 @@ func (d *Driver) recover() error {
 	// that were committed before the driver was started are still in the
 	// WAL and must not be lost. The consumer recognises the ones it has
 	// seen already by their position.
+	//
+	// The frames that the log held already are the business of the
+	// consumer: a reset of the log does not lose them, the consumer holds
+	// the ones it has seen.
+	frames := uint64(0)
+	if log, _, err := d.walFrames(d.ctx); err == nil && log > 0 {
+		frames = uint64(log)
+	}
 	d.mu.Lock()
 	d.cursor = Position{Salt1: hdr.Salt1, Salt2: hdr.Salt2, WALOffset: walOffset(0, d.pageSize)}
 	d.cursorSet = true
+	d.startFrames = frames
 	d.mu.Unlock()
 	return nil
 }
@@ -697,15 +717,36 @@ func (d *Driver) handleGenerationChange(hdr wal.Header) error {
 		d.cursor = Position{Salt1: hdr.Salt1, Salt2: hdr.Salt2, WALOffset: walOffset(0, d.pageSize)}
 		d.cursorSet = true
 		d.walBoundary = 0
+		d.clearAck()
 		return nil
 	}
-	if d.cursor.Frame < d.walBoundary {
-		return fmt.Errorf("driver: the WAL was reset with %d of %d frames uncaptured, a new snapshot is needed", d.walBoundary-d.cursor.Frame, d.walBoundary)
+	// The frames that the log held before the driver started are the
+	// business of the consumer: it holds the ones it has seen already.
+	// Only the frames that the driver had a chance to capture are lost
+	// when the log is reset.
+	lost := d.walBoundary - max(d.cursor.Frame, d.startFrames)
+	if lost > 0 {
+		return fmt.Errorf("%w: the WAL was reset with %d of %d frames uncaptured", ErrSnapshotRequired, lost, d.walBoundary)
 	}
 	d.cursor = Position{Salt1: hdr.Salt1, Salt2: hdr.Salt2, Frame: 0, WALOffset: walOffset(0, d.pageSize)}
 	d.cursorSet = true
 	d.walBoundary = 0
+	d.startFrames = 0
+	d.clearAck()
 	return nil
+}
+
+// clearAck forgets the acknowledged position.
+//
+// The acknowledgement of a generation says nothing about the frames of
+// another one: the frame numbers of a new generation start over. An
+// acknowledgement that is left behind would keep the checkpoint manager from
+// writing the frames of the new generation back into the database.
+//
+// The caller holds the lock of the driver.
+func (d *Driver) clearAck() {
+	d.ack = Position{}
+	d.ackSet = false
 }
 
 // noteWALBoundary records the number of frames the WAL holds.
@@ -722,6 +763,17 @@ func (d *Driver) noteWALBoundary(frames int) {
 	if uint64(frames) > d.walBoundary {
 		d.walBoundary = uint64(frames)
 	}
+}
+
+// setWALBoundary records the number of frames the WAL holds.
+//
+// The boundary belongs to the generation of the log that is read now. A
+// generation that is left behind does not say anything about the frames of
+// the current one.
+func (d *Driver) setWALBoundary(frames uint64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.walBoundary = frames
 }
 
 // cursorPosition returns the position the cursor is at.

@@ -14,6 +14,8 @@ The backup has no baseline when it starts: it asks the source for a snapshot
 of the primary database, it installs it and the increments of the chain that
 follow the baseline of the snapshot bring it up to date.
 
+The primary side of a relay is described in [docs/source.md](source.md).
+
 ## The directory layout
 
 ```text
@@ -52,7 +54,8 @@ time of the write.
   "pageSize": 4096,
   "dbPath": "/var/lib/relay/app.db/backup.db",
   "snapshotBytes": 1048576,
-  "snapshotSHA256": "…"
+  "snapshotSHA256": "…",
+  "paused": false
 }
 ```
 
@@ -67,6 +70,7 @@ time of the write.
 | `dbPath` | the path of the file of the backup database |
 | `snapshotBytes` | the size of the snapshot of the baseline |
 | `snapshotSHA256` | the checksum of the file of the backup database |
+| `paused` | the backup does not touch its database |
 
 The epoch of the backup and the applied sequence belong together: they are
 the two halves of the position of the backup in the chain of the source. The
@@ -208,6 +212,59 @@ for the snapshot when it is resumed.
 The connection to the source stays open while the backup is paused. The source
 sees that the backup is paused, it keeps the heartbeat running and it does
 not push the increments.
+
+## The persistence of the pause and the restart
+
+A pause is a state that outlives the process: the backup database belongs to
+the business until the backup is resumed, and that holds across a restart of
+the relay.
+
+The state file records that the backup is paused. The order of the pause is
+fixed: the state that says that the backup is paused is written before the
+file of the backup database is closed. A backup that is killed between the
+two steps finds the state that says that it is paused and it does not open
+the database.
+
+A backup that starts while the state says that it is paused:
+
+- does not open the backup database and does not check it,
+- does not fail because of the `-journal`, the `-wal` and the `-shm` file the
+  business left behind,
+- reports the state `paused`.
+
+The backup database is not touched in any of these cases: the file keeps its
+content and its modification time and the business may read it and write it
+while the relay is down.
+
+The pause is declared to the source again when the backup connects. The
+protocol remembers a pause that is asked for while the backup is not
+connected and it sends it again as soon as the connection is open. The source
+stops pushing the increments, so that the applier does not meet a file that
+is closed and the backup does not fall into a loop of reconnections.
+
+The resume clears the state that says that the backup is paused before it
+opens the backup database, so that a backup that is killed in between opens
+the database again after a restart. The resume checks the epoch of the chain
+and the connections of the business the same way it does when the backup was
+not restarted.
+
+A backup whose chain was reset while it was paused has no baseline any more.
+The pause ends and the resume reports it with `ErrSnapshotRequired`: the
+backup asks for a new baseline when it connects again.
+
+The order of a restart that falls into the window of a pause:
+
+1. The backup was paused and the state file says that it is paused.
+2. The process dies. The backup database is not written any more.
+3. The backup starts and finds the paused state. It does not open the
+   database, the business keeps it.
+4. The backup connects and declares the pause again. The source stops pushing
+   the increments and keeps them in its spool.
+5. The business closes its connections and the resume opens the database
+   again. The backup catches up with the chain from the sequence number it
+   applied and persisted.
+
+The primary side of a relay is described in [docs/source.md](source.md).
 
 ## The chain that breaks
 
