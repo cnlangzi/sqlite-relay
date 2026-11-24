@@ -1,7 +1,6 @@
 package spool
 
 import (
-	"context"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -33,7 +32,7 @@ type scanResult struct {
 // which sequence number the next transaction gets. The state files are
 // rebuilt from them, a state file that is ahead or behind them does not
 // change anything.
-func (s *Spool) recover(ctx context.Context) error {
+func (s *Spool) recover() error {
 	s.dbID = segment.DatabaseID(s.cfg.DatabaseID)
 
 	stream, err := s.readStreamState()
@@ -41,7 +40,7 @@ func (s *Spool) recover(ctx context.Context) error {
 		return err
 	}
 	if stream != nil && stream.DBID != "" && stream.DBID != hex.EncodeToString(s.dbID[:]) {
-		return fmt.Errorf("%w: the directory holds the database %q", ErrDatabaseMismatch, stream.DatabaseID)
+		return fmt.Errorf("%w: the directory holds the database %q with the identifier %s", ErrDatabaseMismatch, stream.DatabaseID, stream.DBID)
 	}
 	if stream != nil {
 		s.createdAt = stream.CreatedAt
@@ -49,7 +48,7 @@ func (s *Spool) recover(ctx context.Context) error {
 
 	// The files in the temporary directory were never published. Their
 	// data is captured from the write-ahead log again.
-	if err := s.clearTmp(); err != nil {
+	if err := s.removeFiles(s.tmpDir); err != nil {
 		return err
 	}
 
@@ -57,26 +56,34 @@ func (s *Spool) recover(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	s.segs = result.segs
+	s.pageSize = result.pageSize
+
+	// The epoch of the chain comes from the segments, or from the state
+	// file when the chain holds none. It is known even when the chain is
+	// broken: a reset has to raise it.
+	switch {
+	case len(s.segs) > 0:
+		s.epoch = s.segs[0].Epoch
+	case stream != nil:
+		s.epoch = stream.Epoch
+	}
 	if reason != "" {
 		s.broken = true
 		s.reason = reason
 		return fmt.Errorf("%w: %s", ErrChainBroken, reason)
 	}
-	s.segs = result.segs
-	s.pageSize = result.pageSize
 
 	if len(s.segs) > 0 {
 		last := s.segs[len(s.segs)-1]
-		s.epoch = last.Epoch
 		s.nextSeq = last.SeqEnd + 1
 		s.durable = Ack{Seq: last.SeqEnd, Pos: result.pos}
 	} else {
 		if stream != nil {
-			s.epoch = stream.Epoch
 			if stream.PageSize != 0 {
 				s.pageSize = stream.PageSize
 			}
-			if stream.Epoch == s.epoch && stream.NextSeq > s.nextSeq {
+			if stream.NextSeq > 0 {
 				s.nextSeq = stream.NextSeq
 			}
 		}
@@ -90,27 +97,6 @@ func (s *Spool) recover(ctx context.Context) error {
 		return err
 	}
 	return s.writeCaptureState()
-}
-
-// clearTmp removes the files of the temporary directory.
-func (s *Spool) clearTmp() error {
-	entries, err := os.ReadDir(s.tmpDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("spool: read the temporary directory: %w", err)
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		path := filepath.Join(s.tmpDir, e.Name())
-		if err := os.Remove(path); err != nil {
-			return fmt.Errorf("spool: remove %s: %w", path, err)
-		}
-	}
-	return nil
 }
 
 // scanSegments reads the segments of the spool.
@@ -129,6 +115,7 @@ func (s *Spool) scanSegments() (scanResult, string, error) {
 		return scanResult{}, "", fmt.Errorf("spool: read the segments directory: %w", err)
 	}
 
+	var result scanResult
 	type segmentFile struct {
 		path     string
 		seqStart uint64
@@ -141,7 +128,7 @@ func (s *Spool) scanSegments() (scanResult, string, error) {
 		}
 		seqStart, seqEnd, err := parseSegmentName(e.Name())
 		if err != nil {
-			return scanResult{}, fmt.Sprintf("the file %s of the segments directory is not a segment", e.Name()), nil
+			return result, fmt.Sprintf("the file %s of the segments directory is not a segment", e.Name()), nil
 		}
 		files = append(files, segmentFile{
 			path:     filepath.Join(s.segDir, e.Name()),
@@ -151,7 +138,6 @@ func (s *Spool) scanSegments() (scanResult, string, error) {
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].seqStart < files[j].seqStart })
 
-	var result scanResult
 	for i, f := range files {
 		seg, err := segment.ReadFile(f.path)
 		if err != nil {
@@ -161,21 +147,21 @@ func (s *Spool) scanSegments() (scanResult, string, error) {
 				os.Remove(f.path)
 				continue
 			}
-			return scanResult{}, fmt.Sprintf("the segment %s does not hold what it says: %v", filepath.Base(f.path), err), nil
+			return result, fmt.Sprintf("the segment %s does not hold what it says: %v", filepath.Base(f.path), err), nil
 		}
 		if seg.Header.DatabaseID != s.dbID {
 			return scanResult{}, "", fmt.Errorf("%w: the segment %s belongs to another database", ErrDatabaseMismatch, filepath.Base(f.path))
 		}
 		if seg.Header.SeqStart != f.seqStart || seg.Trailer.SeqEnd != f.seqEnd {
-			return scanResult{}, fmt.Sprintf("the segment %s does not hold the range of sequence numbers of its name", filepath.Base(f.path)), nil
+			return result, fmt.Sprintf("the segment %s does not hold the range of sequence numbers of its name", filepath.Base(f.path)), nil
 		}
 		if len(result.segs) > 0 {
 			prev := result.segs[len(result.segs)-1]
 			if seg.Header.Epoch != prev.Epoch {
-				return scanResult{}, fmt.Sprintf("the segment %s belongs to another generation of the chain", filepath.Base(f.path)), nil
+				return result, fmt.Sprintf("the segment %s belongs to another generation of the chain", filepath.Base(f.path)), nil
 			}
 			if seg.Header.SeqStart != prev.SeqEnd+1 {
-				return scanResult{}, fmt.Sprintf("the segment %s starts at the sequence number %d, the segment before it ends at %d", filepath.Base(f.path), seg.Header.SeqStart, prev.SeqEnd), nil
+				return result, fmt.Sprintf("the segment %s starts at the sequence number %d, the segment before it ends at %d", filepath.Base(f.path), seg.Header.SeqStart, prev.SeqEnd), nil
 			}
 		}
 		info, err := os.Stat(f.path)

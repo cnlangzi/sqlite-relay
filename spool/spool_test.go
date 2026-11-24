@@ -695,6 +695,184 @@ func TestTheSpoolDoesNotWriteOnItsOwn(t *testing.T) {
 	}
 }
 
+func TestAPublishThatFailsKeepsTheChainContinuous(t *testing.T) {
+	root := t.TempDir()
+	cfg := Config{Root: root, DatabaseID: "app.db", Mode: ModeFull}
+	s := newTestSpool(t, cfg)
+	appendTx(t, s, testTx(1, 1))
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	// The segment cannot be published.
+	appendTx(t, s, testTx(2, 1))
+	if err := os.Chmod(s.segDir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	err := s.Flush(context.Background())
+	if err := os.Chmod(s.segDir, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if err == nil {
+		t.Fatal("the flush succeeded although the segment could not be published")
+	}
+	ack, err := s.Durable()
+	if err != nil {
+		t.Fatalf("Durable: %v", err)
+	}
+	if ack.Seq != 1 {
+		t.Errorf("the durable sequence number is %d, want 1", ack.Seq)
+	}
+
+	// The next flush publishes the segment that waited.
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	ack, err = s.Durable()
+	if err != nil {
+		t.Fatalf("Durable: %v", err)
+	}
+	if ack.Seq != 2 {
+		t.Errorf("the durable sequence number is %d, want 2", ack.Seq)
+	}
+
+	// The chain of the segments has no hole.
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	s2, err := Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s2.Close()
+	segs, err := s2.Segments()
+	if err != nil {
+		t.Fatalf("Segments: %v", err)
+	}
+	if len(segs) != 2 {
+		t.Fatalf("the spool holds %d segments, want 2", len(segs))
+	}
+	if segs[1].SeqStart != 2 {
+		t.Errorf("the second segment starts at %d, want 2", segs[1].SeqStart)
+	}
+}
+
+func TestResetBringsABrokenChainBack(t *testing.T) {
+	root := t.TempDir()
+	cfg := Config{Root: root, DatabaseID: "app.db", Mode: ModeFull}
+	s := newTestSpool(t, cfg)
+	// The chain is at the epoch 1 after the first reset.
+	if err := s.Reset(context.Background()); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	epoch := s.Epoch()
+	fillSpool(t, s, 3)
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	middle := filepath.Join(root, "app.db", "segments", "0000000000000002-0000000000000002.seg")
+	if err := os.Remove(middle); err != nil {
+		t.Fatalf("remove the segment: %v", err)
+	}
+	broken, err := Open(context.Background(), cfg)
+	if !errors.Is(err, ErrChainBroken) {
+		t.Fatalf("Open returned %v, want ErrChainBroken", err)
+	}
+	defer broken.Close()
+
+	if err := broken.Reset(context.Background()); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if broken.Epoch() <= epoch {
+		t.Errorf("the epoch is %d after the reset, want more than %d", broken.Epoch(), epoch)
+	}
+	appendTx(t, broken, testTx(1, 1))
+	if err := broken.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	ack, err := broken.Durable()
+	if err != nil {
+		t.Fatalf("Durable: %v", err)
+	}
+	if ack.Seq != 1 {
+		t.Errorf("the durable sequence number is %d, want 1", ack.Seq)
+	}
+}
+
+func TestADirectorySyncThatFailsIsRetried(t *testing.T) {
+	s := newTestSpool(t, Config{Mode: ModeNormal})
+	dirSync := s.syncDir
+	failing := true
+	s.syncDir = func(path string) error {
+		if path == s.segDir && failing {
+			return errors.New("the directory cannot be synced")
+		}
+		return dirSync(path)
+	}
+	appendTx(t, s, testTx(1, 1))
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := s.Sync(context.Background()); err == nil {
+		t.Fatal("the barrier succeeded although the directory could not be synced")
+	}
+	ack, err := s.Durable()
+	if err != nil {
+		t.Fatalf("Durable: %v", err)
+	}
+	if ack.Seq != 0 {
+		t.Errorf("the durable sequence number is %d, want 0", ack.Seq)
+	}
+
+	// The next barrier finishes the work of the failed one.
+	failing = false
+	if err := s.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	ack, err = s.Durable()
+	if err != nil {
+		t.Fatalf("Durable: %v", err)
+	}
+	if ack.Seq != 1 {
+		t.Errorf("the durable sequence number is %d, want 1", ack.Seq)
+	}
+}
+
+func TestTheBarrierIsNotDueWithoutWork(t *testing.T) {
+	s := newTestSpool(t, Config{Mode: ModeNormal, SyncInterval: time.Millisecond})
+	time.Sleep(5 * time.Millisecond)
+	pending, err := s.Pending()
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if pending.Due {
+		t.Error("the barrier is due although no segment waits for it")
+	}
+	appendTx(t, s, testTx(1, 1))
+	pending, err = s.Pending()
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if !pending.Due {
+		t.Error("the barrier is not due although a segment waits for it")
+	}
+}
+
+func TestTheSpoolIsClosedAfterClose(t *testing.T) {
+	s := newTestSpool(t, Config{})
+	appendTx(t, s, testTx(1, 1))
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := s.Append(context.Background(), testTx(2, 1)); err == nil {
+		t.Error("the append worked after the spool was closed")
+	}
+	if err := s.Flush(context.Background()); err == nil {
+		t.Error("the flush worked after the spool was closed")
+	}
+}
+
 // filesOf returns the size and the modification time of every file below
 // the directory.
 func filesOf(t *testing.T, dir string) map[string]string {

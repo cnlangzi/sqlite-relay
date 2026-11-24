@@ -80,6 +80,8 @@ var (
 	// ErrDatabaseMismatch reports that the directory belongs to another
 	// database.
 	ErrDatabaseMismatch = errors.New("spool: the directory belongs to another database")
+	// errClosed reports that the spool was closed.
+	errClosed = errors.New("spool: the spool is closed")
 )
 
 // Defaults of the configuration.
@@ -278,6 +280,14 @@ type Spool struct {
 	open      *openSegment
 	broken    bool
 	reason    string
+	closed    bool
+
+	// lastPublished is the segment that was published last. The
+	// acknowledgement moves to it when the barrier succeeded.
+	lastPublished *pendingSegment
+	// barrierPending reports that the barrier of the last publish did not
+	// finish. The next barrier runs it again.
+	barrierPending bool
 
 	lastBarrier       time.Time
 	bytesSinceBarrier int64
@@ -295,7 +305,6 @@ type openSegment struct {
 	file      *os.File
 	writer    *segment.Writer
 	seqStart  uint64
-	lastSeq   uint64
 	lastPos   Pos
 	trailer   segment.Trailer
 	bytes     int64
@@ -308,6 +317,7 @@ type pendingSegment struct {
 	seqStart  uint64
 	bytes     int64
 	createdAt time.Time
+	trailer   segment.Trailer
 }
 
 // Open opens the spool of a database.
@@ -353,7 +363,7 @@ func Open(ctx context.Context, cfg Config) (*Spool, error) {
 	if err := s.makeDirs(); err != nil {
 		return nil, err
 	}
-	if err := s.recover(ctx); err != nil {
+	if err := s.recover(); err != nil {
 		if errors.Is(err, ErrChainBroken) {
 			return s, err
 		}
@@ -392,14 +402,17 @@ func (s *Spool) makeDirs() error {
 // Close releases the file of the segment that is open.
 //
 // The segment is not published, the data of the transactions that were
-// written into it is captured from the write-ahead log again.
+// written into it is captured from the write-ahead log again. The spool
+// cannot be used any more.
 func (s *Spool) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.closed = true
 	if s.open == nil {
 		return nil
 	}
 	err := s.open.file.Close()
+	os.Remove(s.open.path)
 	s.open = nil
 	return err
 }
@@ -433,6 +446,9 @@ func (s *Spool) Append(ctx context.Context, tx Tx) error {
 	if s.broken {
 		return s.brokenError()
 	}
+	if s.closed {
+		return errClosed
+	}
 
 	size := txSize(tx)
 	if s.cfg.MaxBytes > 0 && s.totalBytes()+size > s.cfg.MaxBytes {
@@ -459,7 +475,6 @@ func (s *Spool) Append(ctx context.Context, tx Tx) error {
 		s.discardOpen()
 		return fmt.Errorf("spool: write the transaction: %w", err)
 	}
-	s.open.lastSeq = s.nextSeq
 	s.open.lastPos = tx.Pos
 	s.open.bytes += size
 	s.nextSeq++
@@ -501,7 +516,7 @@ func (s *Spool) checkPageSize(tx Tx) error {
 // openSegment opens the segment that the next transactions are written into.
 func (s *Spool) openSegment() error {
 	if s.pageSize == 0 {
-		return errors.New("spool: the page size of the database is unknown")
+		return errors.New("spool: the page size of the database is unknown, a transaction without pages does not tell it")
 	}
 	path := filepath.Join(s.tmpDir, tmpName(s.nextSeq))
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
@@ -559,6 +574,9 @@ func (s *Spool) discardOpen() {
 // In ModeOff and ModeFull the segment is published and the durable capture
 // acknowledgement advances to its last transaction. In ModeNormal the segment
 // waits in the temporary directory until the barrier of Sync publishes it.
+//
+// A segment that could not be published stays in the queue: the sequence
+// numbers of the chain stay continuous and the next barrier tries it again.
 func (s *Spool) Flush(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -568,10 +586,28 @@ func (s *Spool) Flush(ctx context.Context) error {
 	if s.broken {
 		return s.brokenError()
 	}
-	if s.open == nil {
+	if s.closed {
+		return errClosed
+	}
+	if s.cfg.Mode == ModeNormal {
+		if s.open == nil {
+			return nil
+		}
+		if err := s.closeOpen(); err != nil {
+			return err
+		}
 		return nil
 	}
+	if s.open != nil {
+		if err := s.closeOpen(); err != nil {
+			return err
+		}
+	}
+	return s.publish()
+}
 
+// closeOpen closes the segment that is open and puts it into the queue.
+func (s *Spool) closeOpen() error {
 	o := s.open
 	trailer, err := o.writer.Close(segmentPos(o.lastPos))
 	if err != nil {
@@ -581,54 +617,80 @@ func (s *Spool) Flush(ctx context.Context) error {
 	o.trailer = trailer
 	o.bytes += segment.TrailerSize
 
-	if s.cfg.Mode == ModeFull {
-		if err := s.syncFile(o.path, o.file); err != nil {
-			s.discardOpen()
-			return fmt.Errorf("spool: sync the segment: %w", err)
-		}
-	}
 	if err := o.file.Close(); err != nil {
 		s.open = nil
 		os.Remove(o.path)
 		return fmt.Errorf("spool: close the segment: %w", err)
 	}
 	s.open = nil
+	s.pending = append(s.pending, &pendingSegment{
+		path:      o.path,
+		seqStart:  o.seqStart,
+		bytes:     o.bytes,
+		createdAt: o.createdAt,
+		trailer:   trailer,
+	})
+	return nil
+}
 
-	if s.cfg.Mode == ModeNormal {
-		s.pending = append(s.pending, &pendingSegment{
-			path:      o.path,
-			seqStart:  o.seqStart,
-			bytes:     o.bytes,
-			createdAt: o.createdAt,
-		})
+// publish publishes the segments that wait for it and runs the barrier.
+//
+// The segments are renamed into the segments directory, the barrier syncs the
+// directory. The capture acknowledgement only moves when the barrier
+// succeeded.
+//
+// A segment that could not be published stays in the queue: the sequence
+// numbers of the chain stay continuous and the next barrier tries it again.
+func (s *Spool) publish() error {
+	if len(s.pending) == 0 && !s.barrierPending {
 		return nil
 	}
-
-	if err := s.publish(o); err != nil {
-		return err
+	for i, p := range s.pending {
+		if err := s.publishSegment(p); err != nil {
+			s.pending = s.pending[i:]
+			return err
+		}
 	}
+	s.pending = nil
 	if s.cfg.Mode.syncs() {
 		if err := s.syncDir(s.segDir); err != nil {
+			s.barrierPending = true
 			return fmt.Errorf("spool: sync the segments directory: %w", err)
 		}
 	}
-	return s.setDurable(Ack{Seq: o.trailer.SeqEnd, Pos: spoolPos(o.trailer.Pos())})
+	s.barrierPending = false
+	if s.lastPublished != nil {
+		return s.setDurable(Ack{Seq: s.lastPublished.trailer.SeqEnd, Pos: spoolPos(s.lastPublished.trailer.Pos())})
+	}
+	return nil
 }
 
-// publish renames a closed segment into the segments directory.
-func (s *Spool) publish(o *openSegment) error {
-	final := filepath.Join(s.segDir, segmentName(o.seqStart, o.trailer.SeqEnd))
-	if err := os.Rename(o.path, final); err != nil {
+// publishSegment syncs a segment and renames it into the segments directory.
+func (s *Spool) publishSegment(p *pendingSegment) error {
+	if s.cfg.Mode.syncs() {
+		file, err := os.OpenFile(p.path, os.O_RDWR, 0)
+		if err != nil {
+			return fmt.Errorf("spool: open %s: %w", p.path, err)
+		}
+		err = s.syncFile(p.path, file)
+		file.Close()
+		if err != nil {
+			return fmt.Errorf("spool: sync the segment: %w", err)
+		}
+	}
+	final := filepath.Join(s.segDir, segmentName(p.seqStart, p.trailer.SeqEnd))
+	if err := os.Rename(p.path, final); err != nil {
 		return fmt.Errorf("spool: publish the segment: %w", err)
 	}
 	s.segs = append(s.segs, SegmentRef{
 		Path:      final,
-		SeqStart:  o.seqStart,
-		SeqEnd:    o.trailer.SeqEnd,
+		SeqStart:  p.seqStart,
+		SeqEnd:    p.trailer.SeqEnd,
 		Epoch:     s.epoch,
-		Bytes:     o.bytes,
-		CreatedAt: o.createdAt,
+		Bytes:     p.bytes,
+		CreatedAt: p.createdAt,
 	})
+	s.lastPublished = p
 	return nil
 }
 
@@ -646,54 +708,13 @@ func (s *Spool) Sync(ctx context.Context) error {
 	if s.broken {
 		return s.brokenError()
 	}
-	if s.cfg.Mode != ModeNormal || len(s.pending) == 0 {
+	if s.closed {
+		return errClosed
+	}
+	if s.cfg.Mode != ModeNormal {
 		return nil
 	}
-
-	batch := s.pending
-	s.pending = nil
-	var lastTrailer segment.Trailer
-	for i, p := range batch {
-		// The segments that were not published stay in the queue, the
-		// barrier tries them again.
-		keep := func() {
-			s.pending = append(append([]*pendingSegment{}, batch[i:]...), s.pending...)
-		}
-		file, err := os.OpenFile(p.path, os.O_RDWR, 0)
-		if err != nil {
-			keep()
-			return fmt.Errorf("spool: open %s: %w", p.path, err)
-		}
-		err = s.syncFile(p.path, file)
-		file.Close()
-		if err != nil {
-			keep()
-			return fmt.Errorf("spool: sync the segment: %w", err)
-		}
-		trailer, err := segment.ReadTrailer(p.path)
-		if err != nil {
-			keep()
-			return fmt.Errorf("spool: read the trailer of the segment: %w", err)
-		}
-		final := filepath.Join(s.segDir, segmentName(p.seqStart, trailer.SeqEnd))
-		if err := os.Rename(p.path, final); err != nil {
-			keep()
-			return fmt.Errorf("spool: publish the segment: %w", err)
-		}
-		s.segs = append(s.segs, SegmentRef{
-			Path:      final,
-			SeqStart:  p.seqStart,
-			SeqEnd:    trailer.SeqEnd,
-			Epoch:     s.epoch,
-			Bytes:     p.bytes,
-			CreatedAt: p.createdAt,
-		})
-		lastTrailer = trailer
-	}
-	if err := s.syncDir(s.segDir); err != nil {
-		return fmt.Errorf("spool: sync the segments directory: %w", err)
-	}
-	return s.setDurable(Ack{Seq: lastTrailer.SeqEnd, Pos: spoolPos(lastTrailer.Pos())})
+	return s.publish()
 }
 
 // Durable returns the durable capture acknowledgement of the spool.
@@ -764,6 +785,9 @@ func (s *Spool) due() bool {
 	if s.cfg.Mode != ModeNormal {
 		return false
 	}
+	if len(s.pending) == 0 && s.open == nil && !s.barrierPending {
+		return false
+	}
 	if s.bytesSinceBarrier >= s.cfg.SyncBytes {
 		return true
 	}
@@ -784,6 +808,9 @@ func (s *Spool) SetBackupAck(ctx context.Context, seq uint64) error {
 	defer s.mu.Unlock()
 	if s.broken {
 		return s.brokenError()
+	}
+	if s.closed {
+		return errClosed
 	}
 	return s.writeAckState(seq)
 }
@@ -812,6 +839,9 @@ func (s *Spool) GC(ctx context.Context) (GCResult, error) {
 	defer s.mu.Unlock()
 	if s.broken {
 		return GCResult{}, s.brokenError()
+	}
+	if s.closed {
+		return GCResult{}, errClosed
 	}
 
 	ack, err := s.backupAckLocked()
@@ -864,6 +894,10 @@ func (s *Spool) Reset(ctx context.Context) error {
 	}
 	s.segs = nil
 	s.pending = nil
+	s.lastPublished = nil
+	s.barrierPending = false
+	s.broken = false
+	s.reason = ""
 	s.epoch++
 	s.nextSeq = 1
 	s.durable = Ack{}

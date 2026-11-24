@@ -341,3 +341,35 @@ func TestReadFileAndReadTrailer(t *testing.T) {
 		t.Errorf("the trailer came back as %+v, want %+v", trailer, seg.Trailer)
 	}
 }
+
+func TestASegmentWithoutATransactionIsRejected(t *testing.T) {
+	h := testHeader()
+	b := EncodeHeader(h)
+	b = append(b, EncodeTrailer(Trailer{PayloadCRC: crc32.Checksum(nil, castagnoli)})...)
+
+	if _, err := Read(bytes.NewReader(b)); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("a segment without a transaction was accepted: %v", err)
+	}
+}
+
+func TestASegmentWithAnImpossibleTransactionCountIsRejected(t *testing.T) {
+	h := testHeader()
+	b := EncodeHeader(h)
+	trailer := Trailer{SeqEnd: 1, TxCount: 1 << 40, PayloadBytes: 0, PayloadCRC: crc32.Checksum(nil, castagnoli)}
+	b = append(b, EncodeTrailer(trailer)...)
+
+	if _, err := Read(bytes.NewReader(b)); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("a segment with an impossible transaction count was accepted: %v", err)
+	}
+}
+
+func TestASegmentWithAnImpossiblePageSizeIsRejected(t *testing.T) {
+	h := testHeader()
+	h.PageSize = 1 << 30
+	b := EncodeHeader(h)
+	b = append(b, EncodeTrailer(Trailer{PayloadCRC: crc32.Checksum(nil, castagnoli)})...)
+
+	if _, err := Read(bytes.NewReader(b)); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("a segment with an impossible page size was accepted: %v", err)
+	}
+}

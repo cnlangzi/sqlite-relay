@@ -39,6 +39,12 @@ const (
 	Magic = "SEG1"
 	// Version is the format version this package reads and writes.
 	Version = 1
+	// MaxBytes is the size a segment may not grow beyond. A segment holds
+	// the increments of a database, not a copy of it.
+	MaxBytes = 1 << 30
+	// MinPageSize and MaxPageSize bound the page size a segment may name.
+	MinPageSize = 512
+	MaxPageSize = 65536
 )
 
 // Errors of the package.
@@ -201,6 +207,9 @@ func ParseHeader(b []byte) (Header, error) {
 	}
 	if h.Version != Version {
 		return h, fmt.Errorf("%w: the version is %d", ErrInvalid, h.Version)
+	}
+	if h.PageSize < MinPageSize || h.PageSize > MaxPageSize || h.PageSize&(h.PageSize-1) != 0 {
+		return h, fmt.Errorf("%w: the page size is %d", ErrInvalid, h.PageSize)
 	}
 	if crc32.Checksum(b[0:12], castagnoli) != h.HeaderCRC {
 		return h, fmt.Errorf("%w: the checksum of the header does not match", ErrInvalid)
@@ -377,9 +386,12 @@ func Read(r io.Reader) (*Segment, error) {
 	if err != nil {
 		return nil, err
 	}
-	rest, err := io.ReadAll(r)
+	rest, err := io.ReadAll(io.LimitReader(r, MaxBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("segment: read: %w", err)
+	}
+	if len(rest) > MaxBytes {
+		return nil, fmt.Errorf("%w: the segment is bigger than %d bytes", ErrInvalid, MaxBytes)
 	}
 	if len(rest) < TrailerSize {
 		return nil, fmt.Errorf("%w: %d bytes follow the header", ErrShort, len(rest))
@@ -437,6 +449,12 @@ func ReadTrailer(path string) (Trailer, error) {
 
 // decodePayload decodes the transaction records of a payload.
 func decodePayload(payload []byte, h Header, t Trailer) ([]Tx, error) {
+	if t.TxCount == 0 {
+		return nil, fmt.Errorf("%w: the segment holds no transaction", ErrInvalid)
+	}
+	if t.TxCount > uint64(len(payload)/16) {
+		return nil, fmt.Errorf("%w: the segment holds %d transactions, the payload holds %d bytes", ErrInvalid, t.TxCount, len(payload))
+	}
 	txs := make([]Tx, 0, t.TxCount)
 	var pages uint64
 	off := 0

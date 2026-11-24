@@ -50,8 +50,12 @@ A segment holds a range of the transactions of one database:
 ```
 
 Every field is big endian and every checksum is a CRC32C (Castagnoli). The
-header names the database, the epoch of the chain, the size of the pages and
-the sequence number of the first transaction. A transaction record holds the
+checksum of the header covers the magic, the version and the flags, the
+checksum of the trailer covers the whole trailer and the checksum of the
+payload covers the records. The fields of the header that the checksum does
+not reach are covered by the chain of the segments: the identity of the
+database, the epoch and the sequence numbers are compared with the
+neighbours when the segments are read. A transaction record holds the
 sequence number of the transaction, the size of the database in pages after
 the commit and the pages the transaction changed. The trailer closes the
 segment: it names the last sequence number, the number of the transactions,
@@ -137,6 +141,11 @@ driver do not.
 `Flush` closes the segment. Under `OFF` and `FULL` the segment is published
 and the durable capture acknowledgement moves to its last transaction. Under
 `NORMAL` the segment waits in `tmp/` until `Sync` publishes it.
+
+A segment that could not be published stays in the queue of the spool: the
+next flush or the next barrier publishes it. The sequence numbers of the
+chain stay continuous, so a segment that never reached the disk does not
+leave a hole behind it.
 
 `Durable` returns the durable capture acknowledgement: the sequence number of
 the last transaction that is durable and the position in the write-ahead log
@@ -234,6 +243,16 @@ raises the epoch, starts the sequence numbers over and clears the
 acknowledgements. The chain that was reset is gone, the backup needs a new
 snapshot.
 
+`Reset` is also the way out of a broken chain: the spool that comes with the
+error of `Open` may be reset, the epoch of the broken chain is raised above
+it and the spool is usable again.
+
+A collection that removed every segment takes the durable acknowledgement with
+it: the segments are the truth and there is none of them left, so the
+acknowledgement starts at zero again after a restart. The increments of the
+segments that were collected are applied by the backup and are not captured
+again.
+
 ## The capacity and the monitoring
 
 `MaxBytes` is the limit of the spool. An append that would push the spool
@@ -281,6 +300,13 @@ does not wait for all of them.
 
 A published segment is immutable. Changing one breaks the chain and the
 spool reports `ErrChainBroken` when it reads the segment.
+
+### A spool that is used after it was closed
+
+`Close` releases the file of the segment that is open and makes the spool
+unusable. The transactions that were written into the segment that is open
+are not published, the acknowledgement did not move and the write-ahead log
+of the primary still holds them.
 
 ### A directory that another process writes
 
