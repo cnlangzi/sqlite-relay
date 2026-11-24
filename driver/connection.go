@@ -137,7 +137,7 @@ func (s *managedStmt) Exec(args []driver.Value) (driver.Result, error) {
 	if err := s.d.gate.waitStatement(context.Background(), s.query, s.conn); err != nil {
 		return nil, err
 	}
-	return s.stmt.Exec(args) //nolint:staticcheck // driver.Stmt demands the deprecated method
+	return s.stmt.Exec(args) //nolint:staticcheck // a driver has to implement the deprecated methods of driver.Stmt
 }
 
 // Query implements driver.Stmt.
@@ -145,7 +145,7 @@ func (s *managedStmt) Query(args []driver.Value) (driver.Rows, error) {
 	if err := s.d.gate.waitStatement(context.Background(), s.query, s.conn); err != nil {
 		return nil, err
 	}
-	return s.stmt.Query(args) //nolint:staticcheck // driver.Stmt demands the deprecated method
+	return s.stmt.Query(args) //nolint:staticcheck // a driver has to implement the deprecated methods of driver.Stmt
 }
 
 // ExecContext implements driver.StmtExecContext.
@@ -153,7 +153,7 @@ func (s *managedStmt) ExecContext(ctx context.Context, args []driver.NamedValue)
 	if err := s.d.gate.waitStatement(ctx, s.query, s.conn); err != nil {
 		return nil, err
 	}
-	return s.stmt.Exec(namedToValue(args)) //nolint:staticcheck // driver.Stmt only promises the deprecated method
+	return s.stmt.Exec(namedToValue(args)) //nolint:staticcheck // the statement is held as a driver.Stmt, whose methods are deprecated
 }
 
 // QueryContext implements driver.StmtQueryContext.
@@ -161,7 +161,7 @@ func (s *managedStmt) QueryContext(ctx context.Context, args []driver.NamedValue
 	if err := s.d.gate.waitStatement(ctx, s.query, s.conn); err != nil {
 		return nil, err
 	}
-	return s.stmt.Query(namedToValue(args)) //nolint:staticcheck // driver.Stmt only promises the deprecated method
+	return s.stmt.Query(namedToValue(args)) //nolint:staticcheck // the statement is held as a driver.Stmt, whose methods are deprecated
 }
 
 // namedToValue turns the arguments of a statement into the values the
