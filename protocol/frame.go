@@ -47,6 +47,10 @@ const (
 	MsgResyncRequired MessageType = 10
 	// MsgError tells the peer that the connection is ended.
 	MsgError MessageType = 11
+	// MsgSnapshotMeta carries the manifest of a snapshot.
+	MsgSnapshotMeta MessageType = 12
+	// MsgSnapshotData carries a part of the file of a snapshot.
+	MsgSnapshotData MessageType = 13
 )
 
 // String returns the name of the type.
@@ -74,6 +78,10 @@ func (t MessageType) String() string {
 		return "RESYNC_REQUIRED"
 	case MsgError:
 		return "ERROR"
+	case MsgSnapshotMeta:
+		return "SNAPSHOT_META"
+	case MsgSnapshotData:
+		return "SNAPSHOT_DATA"
 	}
 	return fmt.Sprintf("MessageType(%d)", uint8(t))
 }

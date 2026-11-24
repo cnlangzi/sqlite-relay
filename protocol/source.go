@@ -2,8 +2,10 @@ package protocol
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"slices"
@@ -20,11 +22,19 @@ var errSessionEnded = errors.New("protocol: the session ended")
 // source for segments again.
 const pollInterval = 50 * time.Millisecond
 
+// snapshotChunkBytes is the number of bytes of the snapshot the source holds
+// in memory while it sends it.
+const snapshotChunkBytes = 4 << 20
+
 // Source accepts the connections of the backups and pushes the segments of
 // the spool.
 type Source struct {
 	cfg Config
 	src SegmentSource
+
+	// provider produces the snapshot a backup asks for. It is nil when the
+	// source cannot produce one.
+	provider SnapshotProvider
 
 	mu      sync.Mutex
 	applied uint64
@@ -33,6 +43,15 @@ type Source struct {
 
 // NewSource creates a source that pushes the segments of src.
 func NewSource(cfg Config, src SegmentSource) (*Source, error) {
+	return NewSourceWithSnapshot(cfg, src, nil)
+}
+
+// NewSourceWithSnapshot creates a source that pushes the segments of src and
+// that sends a snapshot to a backup that asks for one.
+//
+// The provider is nil when the source cannot produce a snapshot. A backup
+// that asks for one is answered with an error.
+func NewSourceWithSnapshot(cfg Config, src SegmentSource, provider SnapshotProvider) (*Source, error) {
 	cfg = cfg.withDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -40,7 +59,7 @@ func NewSource(cfg Config, src SegmentSource) (*Source, error) {
 	if src == nil {
 		return nil, errors.New("protocol: the segment source is nil")
 	}
-	return &Source{cfg: cfg, src: src}, nil
+	return &Source{cfg: cfg, src: src, provider: provider}, nil
 }
 
 // AppliedSeq returns the sequence number the backup acknowledged last.
@@ -63,8 +82,9 @@ func (s *Source) LastError() error {
 // Serve accepts the connections of the backups.
 //
 // It runs one connection at a time. A connection that failed is ended and
-// the next one is accepted. A connection that needs a new snapshot ends the
-// serve with ErrResyncRequired.
+// the next one is accepted. A connection that needs a new snapshot does not
+// end the serve: the backup asks for a snapshot in the hello of its next
+// connection and the source sends it.
 func (s *Source) Serve(ctx context.Context, ln net.Listener) error {
 	stop := make(chan struct{})
 	defer close(stop)
@@ -84,9 +104,6 @@ func (s *Source) Serve(ctx context.Context, ln net.Listener) error {
 			return err
 		}
 		err = s.serveConn(ctx, c)
-		if errors.Is(err, ErrResyncRequired) {
-			return err
-		}
 		s.mu.Lock()
 		s.lastErr = err
 		s.mu.Unlock()
@@ -147,6 +164,10 @@ type sourceSession struct {
 	lastSent  uint64
 	err       error
 	resync    error
+
+	// needsSnapshot tells the send loop that the backup asked for a
+	// snapshot and that the segments of the chain follow it.
+	needsSnapshot bool
 
 	// resetQueue tells the send loop that the segments it fetched are
 	// not the ones the source continues with.
@@ -250,6 +271,17 @@ func (sess *sourceSession) handshake() error {
 		sess.sendError(CodeProtocol, "the first message is not a hello")
 		return fmt.Errorf("%w: the first message is %s", ErrInvalidFrame, t)
 	}
+	// The version is the first field of the hello. It is read before the
+	// payload is decoded: a peer of another version is told so instead of
+	// getting a hello that does not parse.
+	if len(payload) < 4 {
+		sess.sendError(CodeVersion, "the hello is too short")
+		return fmt.Errorf("%w: the hello is %d bytes", ErrInvalidFrame, len(payload))
+	}
+	if v := binary.BigEndian.Uint32(payload[:4]); v != ProtocolVersion {
+		sess.sendError(CodeVersion, fmt.Sprintf("the protocol version %d is not supported", v))
+		return fmt.Errorf("protocol: the protocol version %d is not supported", v)
+	}
 	hello, err := decodeHello(payload)
 	if err != nil {
 		sess.sendError(CodeProtocol, "the hello is malformed")
@@ -281,13 +313,18 @@ func (sess *sourceSession) handshake() error {
 		return errors.New("protocol: the stream does not match")
 	}
 	epoch := sess.src.src.Epoch()
-	if hello.Epoch != epoch {
-		sess.sendResync(ResyncEpochMismatch, epoch, hello.AppliedSeq)
-		return fmt.Errorf("%w: the epoch of the backup is %d, the epoch of the source is %d", ErrResyncRequired, hello.Epoch, epoch)
-	}
-	if oldest := sess.src.src.OldestSeq(); oldest > hello.AppliedSeq+1 {
-		sess.sendResync(ResyncGap, epoch, oldest)
-		return fmt.Errorf("%w: the lowest sequence number of the source is %d, the backup applied %d", ErrResyncRequired, oldest, hello.AppliedSeq)
+	// A backup that asks for a snapshot has no chain yet. There is nothing
+	// to compare the epoch and the applied sequence of the backup with, the
+	// snapshot carries the epoch of the chain it is bound to.
+	if !hello.NeedsSnapshot {
+		if hello.Epoch != epoch {
+			sess.sendResync(ResyncEpochMismatch, epoch, hello.AppliedSeq)
+			return fmt.Errorf("%w: the epoch of the backup is %d, the epoch of the source is %d", ErrResyncRequired, hello.Epoch, epoch)
+		}
+		if oldest := sess.src.src.OldestSeq(); oldest > hello.AppliedSeq+1 {
+			sess.sendResync(ResyncGap, epoch, oldest)
+			return fmt.Errorf("%w: the lowest sequence number of the source is %d, the backup applied %d", ErrResyncRequired, oldest, hello.AppliedSeq)
+		}
 	}
 	nonce, err := newNonce()
 	if err != nil {
@@ -309,6 +346,7 @@ func (sess *sourceSession) handshake() error {
 	sess.sent = hello.AppliedSeq
 	sess.fetched = hello.AppliedSeq
 	sess.limit = sess.src.cfg.MaxUnackedBytes
+	sess.needsSnapshot = hello.NeedsSnapshot
 	sess.mu.Unlock()
 	return nil
 }
@@ -420,6 +458,16 @@ func (sess *sourceSession) sendLoop(ctx context.Context) error {
 			queue = nil
 			fetched = sent
 		}
+		if sess.needsSnapshotLocked() {
+			// The snapshot is the baseline of the backup, the segments of
+			// the chain that follow it bring the backup up to date.
+			if err := sess.sendSnapshot(ctx); err != nil {
+				return err
+			}
+			// The cursors of the session moved to the baseline of the
+			// snapshot, the loop reads them again.
+			continue
+		}
 
 		// The batch never holds more than the window of the backup
 		// allows, so that the bytes in flight stay below the limit.
@@ -459,6 +507,79 @@ func (sess *sourceSession) sendLoop(ctx context.Context) error {
 		sess.advance(sent, chosen)
 		queue = queue[len(chosen):]
 	}
+}
+
+// sendSnapshot sends a snapshot to the backup.
+//
+// The manifest comes first, the bytes of the file follow in parts. The bytes
+// of the snapshot are not bound by the window of the backup: the window
+// counts the segments of the chain, a snapshot is a file that is read once
+// from the beginning to the end.
+func (sess *sourceSession) sendSnapshot(ctx context.Context) error {
+	provider := sess.src.provider
+	if provider == nil {
+		sess.sendError(CodeProtocol, "the source cannot produce a snapshot")
+		return errors.New("protocol: the source cannot produce a snapshot")
+	}
+	meta, r, err := provider.Snapshot(ctx)
+	if err != nil {
+		sess.sendError(CodeProtocol, "the snapshot failed")
+		return fmt.Errorf("protocol: the snapshot failed: %w", err)
+	}
+	defer r.Close()
+	if meta.DatabaseID != segment.DatabaseID(sess.src.cfg.DatabaseID) {
+		sess.sendError(CodeIdentity, "the snapshot belongs to another database")
+		return errors.New("protocol: the snapshot belongs to another database")
+	}
+	if meta.Epoch != sess.src.src.Epoch() {
+		// The chain was reset while the snapshot was taken, the snapshot
+		// does not belong to the chain of this connection.
+		sess.sendResync(ResyncEpochMismatch, meta.Epoch, meta.BaselineSeq)
+		return fmt.Errorf("%w: the epoch of the snapshot is %d, the epoch of the source is %d", ErrResyncRequired, meta.Epoch, sess.src.src.Epoch())
+	}
+	if err := sess.conn.writeMessage(meta); err != nil {
+		return err
+	}
+	// A part of the file has to fit into a frame of the peer.
+	chunk := int64(snapshotChunkBytes)
+	if limit := sess.src.cfg.MaxFrameBytes; limit > 0 && limit < chunk {
+		chunk = limit
+	}
+	buf := make([]byte, chunk)
+	var sent uint64
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if err := sess.conn.writeMessage(SnapshotData{Data: buf[:n]}); err != nil {
+				return err
+			}
+			sent += uint64(n)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("protocol: read the snapshot: %w", err)
+		}
+	}
+	if sent != meta.Bytes {
+		return fmt.Errorf("protocol: the snapshot holds %d bytes, the manifest says %d", sent, meta.Bytes)
+	}
+	// The chain continues after the baseline of the snapshot.
+	sess.mu.Lock()
+	sess.sent = meta.BaselineSeq
+	sess.fetched = meta.BaselineSeq
+	sess.applied = meta.BaselineSeq
+	sess.needsSnapshot = false
+	sess.mu.Unlock()
+	return nil
+}
+
+// needsSnapshotLocked reports whether the backup asked for a snapshot.
+func (sess *sourceSession) needsSnapshotLocked() bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.needsSnapshot
 }
 
 // advance records the segments that were sent.

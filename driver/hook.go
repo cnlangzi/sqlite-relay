@@ -26,8 +26,14 @@ func (d *Driver) walHook(dbName string, frames int) (rc int) {
 // notify delivers a commit notification without blocking the writer.
 //
 // The channel is allowed to be full: a dropped notification only costs a
-// wake-up, the periodic scan finds the same commit anyway.
+// wake-up, the periodic scan finds the same commit anyway. The channel may
+// be closed already, a notification that nobody waits for is dropped.
 func (d *Driver) notify(n Notification) {
+	d.eventsMu.Lock()
+	defer d.eventsMu.Unlock()
+	if d.eventsClosed {
+		return
+	}
 	select {
 	case d.events <- n:
 	default:

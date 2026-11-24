@@ -190,10 +190,10 @@ func TestSourceRemembersTheErrorOfTheLastConnection(t *testing.T) {
 	}
 }
 
-func TestSourceStopsOnTheResyncOfTheBackup(t *testing.T) {
+func TestSourceRemembersTheResyncOfTheBackup(t *testing.T) {
 	cfg := testConfig(t)
 	src := &fakeSource{}
-	addr, _, errCh := startSource(t, cfg, src)
+	addr, source, _ := startSource(t, cfg, src)
 
 	cl := dialClient(t, addr)
 	cl.write(testHello(t, cfg, testToken))
@@ -201,13 +201,11 @@ func TestSourceStopsOnTheResyncOfTheBackup(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 	cl.write(ResyncRequired{Reason: ResyncGap, Epoch: 0, Seq: 3})
-	select {
-	case err := <-errCh:
-		if !errors.Is(err, ErrResyncRequired) {
-			t.Fatalf("the serve ended with %v, want %v", err, ErrResyncRequired)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the serve did not end")
+	if !waitFor(t, 5*time.Second, func() bool { return source.LastError() != nil }) {
+		t.Fatal("the source did not remember the resync")
+	}
+	if !errors.Is(source.LastError(), ErrResyncRequired) {
+		t.Errorf("the source holds the error %v, want %v", source.LastError(), ErrResyncRequired)
 	}
 }
 
@@ -231,7 +229,7 @@ func TestSourceResyncsOnEpochMismatch(t *testing.T) {
 	cfg := testConfig(t)
 	src := &fakeSource{}
 	src.setEpoch(3)
-	addr, _, errCh := startSource(t, cfg, src)
+	addr, source, _ := startSource(t, cfg, src)
 
 	cl := dialClient(t, addr)
 	cl.write(testHello(t, cfg, testToken))
@@ -250,13 +248,10 @@ func TestSourceResyncsOnEpochMismatch(t *testing.T) {
 	if m.Reason != ResyncEpochMismatch {
 		t.Errorf("the reason is %s, want the epoch mismatch", m.Reason)
 	}
-	select {
-	case err := <-errCh:
-		if !errors.Is(err, ErrResyncRequired) {
-			t.Fatalf("the serve ended with %v, want %v", err, ErrResyncRequired)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the serve did not end")
+	// The source keeps serving: the backup asks for a snapshot in the hello
+	// of its next connection.
+	if !waitFor(t, 5*time.Second, func() bool { return source.LastError() != nil }) {
+		t.Fatal("the source did not remember the resync")
 	}
 }
 
@@ -264,7 +259,7 @@ func TestSourceResyncsOnGap(t *testing.T) {
 	cfg := testConfig(t)
 	src := &fakeSource{}
 	src.add(Segment{SeqStart: 5, SeqEnd: 6, Bytes: []byte("a segment")})
-	addr, _, errCh := startSource(t, cfg, src)
+	addr, source, _ := startSource(t, cfg, src)
 
 	cl := dialClient(t, addr)
 	cl.write(testHello(t, cfg, testToken))
@@ -283,13 +278,10 @@ func TestSourceResyncsOnGap(t *testing.T) {
 	if m.Reason != ResyncGap {
 		t.Errorf("the reason is %s, want the gap", m.Reason)
 	}
-	select {
-	case err := <-errCh:
-		if !errors.Is(err, ErrResyncRequired) {
-			t.Fatalf("the serve ended with %v, want %v", err, ErrResyncRequired)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the serve did not end")
+	// The source keeps serving: the backup asks for a snapshot in the hello
+	// of its next connection.
+	if !waitFor(t, 5*time.Second, func() bool { return source.LastError() != nil }) {
+		t.Fatal("the source did not remember the resync")
 	}
 }
 

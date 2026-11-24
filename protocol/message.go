@@ -13,6 +13,8 @@ const (
 	nonceSize = 32
 	// databaseIDSize is the size of the identifier of a database.
 	databaseIDSize = 16
+	// checksumSize is the size of the checksum of a snapshot.
+	checksumSize = 32
 	// MaxBackupIDLen is the size of the identifier of a backup.
 	MaxBackupIDLen = 64
 )
@@ -105,6 +107,9 @@ type Hello struct {
 	StreamID uint64
 	// Epoch is the generation of the chain the backup is part of.
 	Epoch uint64
+	// NeedsSnapshot reports that the backup has no baseline yet. The source
+	// sends a snapshot instead of the segments of the chain.
+	NeedsSnapshot bool
 	// BackupID names the backup.
 	BackupID string
 	// AppliedSeq is the highest sequence number the backup applied and
@@ -121,11 +126,12 @@ func (m Hello) Type() MessageType { return MsgHello }
 
 // encode returns the payload of the message.
 func (m Hello) encode() []byte {
-	b := make([]byte, 0, 4+databaseIDSize+8+8+2+len(m.BackupID)+8+nonceSize+macSize)
+	b := make([]byte, 0, 4+databaseIDSize+8+8+1+2+len(m.BackupID)+8+nonceSize+macSize)
 	b = binary.BigEndian.AppendUint32(b, m.ProtocolVersion)
 	b = append(b, m.DatabaseID[:]...)
 	b = binary.BigEndian.AppendUint64(b, m.StreamID)
 	b = binary.BigEndian.AppendUint64(b, m.Epoch)
+	b = append(b, boolByte(m.NeedsSnapshot))
 	b = binary.BigEndian.AppendUint16(b, uint16(len(m.BackupID)))
 	b = append(b, m.BackupID...)
 	b = binary.BigEndian.AppendUint64(b, m.AppliedSeq)
@@ -204,6 +210,66 @@ func (m Batch) encode() []byte {
 		b = append(b, s...)
 	}
 	return b
+}
+
+// SnapshotMeta is the manifest of a snapshot.
+//
+// It names the database the snapshot belongs to, the generation of the chain
+// it is bound to and the sequence number of the last transaction it holds.
+// The baseline sequence is the link between the snapshot and the chain: the
+// increments of the chain that follow it bring the database up to date.
+type SnapshotMeta struct {
+	// FormatVersion is the version of the format of the snapshot.
+	FormatVersion uint32
+	// DatabaseID names the database the snapshot belongs to.
+	DatabaseID [databaseIDSize]byte
+	// StreamID is the number of the stream the snapshot belongs to.
+	StreamID uint64
+	// Epoch is the generation of the chain the snapshot is bound to.
+	Epoch uint64
+	// BaselineSeq is the sequence number of the last transaction the
+	// snapshot holds.
+	BaselineSeq uint64
+	// PageSize is the size of the pages of the database.
+	PageSize uint32
+	// Bytes is the size of the file of the snapshot.
+	Bytes uint64
+	// Checksum is the SHA-256 of the file of the snapshot.
+	Checksum [checksumSize]byte
+}
+
+// Type returns the type of the message.
+func (m SnapshotMeta) Type() MessageType { return MsgSnapshotMeta }
+
+// encode returns the payload of the message.
+func (m SnapshotMeta) encode() []byte {
+	b := make([]byte, 0, 4+databaseIDSize+8+8+8+4+8+checksumSize)
+	b = binary.BigEndian.AppendUint32(b, m.FormatVersion)
+	b = append(b, m.DatabaseID[:]...)
+	b = binary.BigEndian.AppendUint64(b, m.StreamID)
+	b = binary.BigEndian.AppendUint64(b, m.Epoch)
+	b = binary.BigEndian.AppendUint64(b, m.BaselineSeq)
+	b = binary.BigEndian.AppendUint32(b, m.PageSize)
+	b = binary.BigEndian.AppendUint64(b, m.Bytes)
+	b = append(b, m.Checksum[:]...)
+	return b
+}
+
+// SnapshotData carries a part of the file of a snapshot.
+//
+// The payload holds the bytes of the file. There is no length prefix: the
+// size of the payload is the size of the part.
+type SnapshotData struct {
+	// Data holds the bytes of the part of the file.
+	Data []byte
+}
+
+// Type returns the type of the message.
+func (m SnapshotData) Type() MessageType { return MsgSnapshotData }
+
+// encode returns the payload of the message.
+func (m SnapshotData) encode() []byte {
+	return m.Data
 }
 
 // Ack carries the sequence number the backup applied.
@@ -367,6 +433,14 @@ func (m Error) encode() []byte {
 	return b
 }
 
+// boolByte returns the byte that carries a flag.
+func boolByte(v bool) byte {
+	if v {
+		return 1
+	}
+	return 0
+}
+
 // reader reads the fields of a payload.
 type reader struct {
 	b   []byte
@@ -480,6 +554,7 @@ func decodeHello(payload []byte) (Hello, error) {
 	copy(m.DatabaseID[:], r.fixed(databaseIDSize))
 	m.StreamID = r.u64()
 	m.Epoch = r.u64()
+	m.NeedsSnapshot = r.u8() == 1
 	m.BackupID = r.str(MaxBackupIDLen)
 	m.AppliedSeq = r.u64()
 	copy(m.Nonce[:], r.fixed(nonceSize))
@@ -524,6 +599,24 @@ func decodeBatch(payload []byte) (Batch, error) {
 		}
 		m.Segments = append(m.Segments, r.fixed(int(n)))
 	}
+	if err := r.done(); err != nil {
+		return m, err
+	}
+	return m, nil
+}
+
+// decodeSnapshotMeta decodes the payload of the manifest of a snapshot.
+func decodeSnapshotMeta(payload []byte) (SnapshotMeta, error) {
+	var m SnapshotMeta
+	r := newReader(payload)
+	m.FormatVersion = r.u32()
+	copy(m.DatabaseID[:], r.fixed(databaseIDSize))
+	m.StreamID = r.u64()
+	m.Epoch = r.u64()
+	m.BaselineSeq = r.u64()
+	m.PageSize = r.u32()
+	m.Bytes = r.u64()
+	copy(m.Checksum[:], r.fixed(checksumSize))
 	if err := r.done(); err != nil {
 		return m, err
 	}

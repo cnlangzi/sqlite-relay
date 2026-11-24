@@ -13,6 +13,7 @@ func TestHelloRoundTrip(t *testing.T) {
 		DatabaseID:      [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
 		StreamID:        3,
 		Epoch:           7,
+		NeedsSnapshot:   true,
 		BackupID:        "backup-1",
 		AppliedSeq:      42,
 		Nonce:           [32]byte{9: 1, 31: 2},
@@ -34,6 +35,9 @@ func TestHelloRoundTrip(t *testing.T) {
 	if got.Epoch != m.Epoch {
 		t.Errorf("the epoch is %d, want %d", got.Epoch, m.Epoch)
 	}
+	if !got.NeedsSnapshot {
+		t.Error("the hello does not ask for a snapshot")
+	}
 	if got.BackupID != m.BackupID {
 		t.Errorf("the backup ID is %q, want %q", got.BackupID, m.BackupID)
 	}
@@ -52,6 +56,47 @@ func TestHelloRejectsLongBackupID(t *testing.T) {
 	m := Hello{BackupID: string(bytes.Repeat([]byte("b"), MaxBackupIDLen+1))}
 	if _, err := decodeHello(m.encode()); err == nil {
 		t.Fatal("the hello with a long backup ID was accepted")
+	}
+}
+
+func TestSnapshotMetaRoundTrip(t *testing.T) {
+	m := SnapshotMeta{
+		FormatVersion: 1,
+		DatabaseID:    [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		StreamID:      3,
+		Epoch:         7,
+		BaselineSeq:   42,
+		PageSize:      4096,
+		Bytes:         8192,
+		Checksum:      [32]byte{5: 3},
+	}
+	got, err := decodeSnapshotMeta(m.encode())
+	if err != nil {
+		t.Fatalf("decodeSnapshotMeta: %v", err)
+	}
+	if got.FormatVersion != m.FormatVersion {
+		t.Errorf("the format version is %d, want %d", got.FormatVersion, m.FormatVersion)
+	}
+	if got.DatabaseID != m.DatabaseID {
+		t.Errorf("the database ID is %x, want %x", got.DatabaseID, m.DatabaseID)
+	}
+	if got.StreamID != m.StreamID {
+		t.Errorf("the stream ID is %d, want %d", got.StreamID, m.StreamID)
+	}
+	if got.Epoch != m.Epoch {
+		t.Errorf("the epoch is %d, want %d", got.Epoch, m.Epoch)
+	}
+	if got.BaselineSeq != m.BaselineSeq {
+		t.Errorf("the baseline sequence is %d, want %d", got.BaselineSeq, m.BaselineSeq)
+	}
+	if got.PageSize != m.PageSize {
+		t.Errorf("the page size is %d, want %d", got.PageSize, m.PageSize)
+	}
+	if got.Bytes != m.Bytes {
+		t.Errorf("the size is %d, want %d", got.Bytes, m.Bytes)
+	}
+	if got.Checksum != m.Checksum {
+		t.Errorf("the checksum is %x, want %x", got.Checksum, m.Checksum)
 	}
 }
 
