@@ -30,16 +30,16 @@ func (d *Driver) acquirePin(ctx context.Context) (*readPin, error) {
 	// take a read mark at all.
 	var n int
 	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_schema").Scan(&n); err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return nil, fmt.Errorf("driver: take read mark: %w", err)
 	}
 	log, _, err := d.walFrames(ctx)
 	if err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return nil, err
 	}
 	if log < 0 {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return nil, fmt.Errorf("driver: SQLite could not report the frame count of the WAL")
 	}
 	return &readPin{tx: tx, mark: uint64(log)}, nil
@@ -50,7 +50,7 @@ func (p *readPin) release() {
 	if p == nil {
 		return
 	}
-	p.tx.Rollback()
+	_ = p.tx.Rollback()
 }
 
 // runCheckpoint runs a passive checkpoint.
@@ -276,7 +276,7 @@ func (d *Driver) reclaim(ctx context.Context) (reclaimResult, error) {
 	sealed := true
 	defer func() {
 		if sealed {
-			d.sealConn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
+			_, _ = d.sealConn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
 		}
 	}()
 

@@ -216,19 +216,19 @@ func (s *Spool) writeFileAtomic(path string, data []byte) error {
 		return fmt.Errorf("spool: create a temporary file: %w", err)
 	}
 	tmp := file.Name()
-	defer os.Remove(tmp)
+	defer func() { _ = os.Remove(tmp) }()
 
 	if _, err := file.Write(data); err != nil {
-		file.Close()
+		_ = file.Close()
 		return fmt.Errorf("spool: write %s: %w", tmp, err)
 	}
 	if err := file.Chmod(0o644); err != nil {
-		file.Close()
+		_ = file.Close()
 		return fmt.Errorf("spool: write %s: %w", tmp, err)
 	}
 	if s.cfg.Mode.syncs() {
 		if err := s.syncFile(tmp, file); err != nil {
-			file.Close()
+			_ = file.Close()
 			return fmt.Errorf("spool: sync %s: %w", tmp, err)
 		}
 	}

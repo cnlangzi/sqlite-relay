@@ -144,7 +144,7 @@ func (s *Spool) scanSegments() (scanResult, string, error) {
 			if i == len(files)-1 {
 				// The last segment of the chain is broken. The data of
 				// it is captured from the write-ahead log again.
-				os.Remove(f.path)
+				_ = os.Remove(f.path)
 				continue
 			}
 			return result, fmt.Sprintf("the segment %s does not hold what it says: %v", filepath.Base(f.path), err), nil

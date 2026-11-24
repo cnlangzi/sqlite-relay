@@ -78,7 +78,7 @@ func Open(path string) (*Reader, error) {
 	}
 	var head [HeaderSize]byte
 	if _, err := io.ReadFull(f, head[:]); err != nil {
-		f.Close()
+		_ = f.Close()
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return nil, ErrNoWAL
 		}
@@ -86,7 +86,7 @@ func Open(path string) (*Reader, error) {
 	}
 	hdr, err := ParseHeader(head[:])
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	return &Reader{
@@ -116,7 +116,7 @@ func ReadHeader(path string) (Header, error) {
 		}
 		return Header{}, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	var head [HeaderSize]byte
 	if _, err := io.ReadFull(f, head[:]); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {

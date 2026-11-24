@@ -71,7 +71,7 @@ func (s *Source) Serve(ctx context.Context, ln net.Listener) error {
 	go func() {
 		select {
 		case <-ctx.Done():
-			ln.Close()
+			_ = ln.Close()
 		case <-stop:
 		}
 	}()
@@ -101,7 +101,7 @@ func (s *Source) serveConn(ctx context.Context, c net.Conn) error {
 		wake: make(chan struct{}, 1),
 		done: make(chan struct{}),
 	}
-	defer sess.conn.Close()
+	defer func() { _ = sess.conn.Close() }()
 	return sess.run(ctx)
 }
 
@@ -170,7 +170,7 @@ func (sess *sourceSession) run(ctx context.Context) error {
 	// session ends so that the wait does not hold the session up.
 	go func() {
 		<-sctx.Done()
-		sess.conn.Close()
+		_ = sess.conn.Close()
 	}()
 
 	if err := sess.handshake(); err != nil {
@@ -208,7 +208,7 @@ func (sess *sourceSession) finish(err error) {
 		if cancel != nil {
 			cancel()
 		}
-		sess.conn.Close()
+		_ = sess.conn.Close()
 		close(sess.done)
 	})
 	// A resync matters more than an error of the transport: the peer may
@@ -598,12 +598,12 @@ func (sess *sourceSession) wait(ctx context.Context, d time.Duration) error {
 
 // sendError tells the peer that the connection is ended.
 func (sess *sourceSession) sendError(code ErrorCode, msg string) {
-	sess.conn.writeMessage(Error{Code: code, Message: msg})
+	_ = sess.conn.writeMessage(Error{Code: code, Message: msg})
 }
 
 // sendResync tells the peer that a new snapshot is needed.
 func (sess *sourceSession) sendResync(reason ResyncReason, epoch, seq uint64) {
-	sess.conn.writeMessage(ResyncRequired{Reason: reason, Epoch: epoch, Seq: seq})
+	_ = sess.conn.writeMessage(ResyncRequired{Reason: reason, Epoch: epoch, Seq: seq})
 }
 
 // packBatch packs the segments into a batch.

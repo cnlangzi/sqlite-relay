@@ -40,7 +40,7 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	}
 	sc, ok := conn.(*sqlite3.SQLiteConn)
 	if !ok {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("driver: unexpected connection type %T", conn)
 	}
 	mc := &managedConn{conn: sc, d: c.d, gated: c.gated}
@@ -137,7 +137,7 @@ func (s *managedStmt) Exec(args []driver.Value) (driver.Result, error) {
 	if err := s.d.gate.waitStatement(context.Background(), s.query, s.conn); err != nil {
 		return nil, err
 	}
-	return s.stmt.Exec(args)
+	return s.stmt.Exec(args) //nolint:staticcheck // driver.Stmt demands the deprecated method
 }
 
 // Query implements driver.Stmt.
@@ -145,7 +145,7 @@ func (s *managedStmt) Query(args []driver.Value) (driver.Rows, error) {
 	if err := s.d.gate.waitStatement(context.Background(), s.query, s.conn); err != nil {
 		return nil, err
 	}
-	return s.stmt.Query(args)
+	return s.stmt.Query(args) //nolint:staticcheck // driver.Stmt demands the deprecated method
 }
 
 // ExecContext implements driver.StmtExecContext.
@@ -153,7 +153,7 @@ func (s *managedStmt) ExecContext(ctx context.Context, args []driver.NamedValue)
 	if err := s.d.gate.waitStatement(ctx, s.query, s.conn); err != nil {
 		return nil, err
 	}
-	return s.stmt.Exec(namedToValue(args))
+	return s.stmt.Exec(namedToValue(args)) //nolint:staticcheck // driver.Stmt only promises the deprecated method
 }
 
 // QueryContext implements driver.StmtQueryContext.
@@ -161,7 +161,7 @@ func (s *managedStmt) QueryContext(ctx context.Context, args []driver.NamedValue
 	if err := s.d.gate.waitStatement(ctx, s.query, s.conn); err != nil {
 		return nil, err
 	}
-	return s.stmt.Query(namedToValue(args))
+	return s.stmt.Query(namedToValue(args)) //nolint:staticcheck // driver.Stmt only promises the deprecated method
 }
 
 // namedToValue turns the arguments of a statement into the values the
@@ -374,7 +374,7 @@ func pragmaValue(conn *sqlite3.SQLiteConn, query string) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	dest := make([]driver.Value, 1)
 	if err := rows.Next(dest); err != nil {
 		return nil, fmt.Errorf("driver: %q: %w", query, err)

@@ -174,7 +174,7 @@ func (b *Backup) runSession(ctx context.Context, addr string) (bool, error) {
 		pausedCh: make(chan Paused, 1),
 		done:     make(chan struct{}),
 	}
-	defer sess.conn.Close()
+	defer func() { _ = sess.conn.Close() }()
 	defer b.clearSession(sess)
 
 	sctx, cancel := context.WithCancel(ctx)
@@ -187,7 +187,7 @@ func (b *Backup) runSession(ctx context.Context, addr string) (bool, error) {
 	// session ends so that the wait does not hold the session up.
 	go func() {
 		<-sctx.Done()
-		sess.conn.Close()
+		_ = sess.conn.Close()
 	}()
 
 	if err := sess.handshake(ctx); err != nil {
@@ -331,7 +331,7 @@ func (sess *backupSession) finish(err error) {
 		if cancel != nil {
 			cancel()
 		}
-		sess.conn.Close()
+		_ = sess.conn.Close()
 		close(sess.done)
 	})
 	// A resync matters more than an error of the transport: the peer may
@@ -366,7 +366,7 @@ func (sess *backupSession) readLoop(ctx context.Context) error {
 		t, payload, err := sess.conn.readFrame()
 		if err != nil {
 			if errors.Is(err, ErrInvalidFrame) {
-				sess.conn.writeMessage(Error{Code: CodeProtocol, Message: "the frame is not a frame of the protocol"})
+				_ = sess.conn.writeMessage(Error{Code: CodeProtocol, Message: "the frame is not a frame of the protocol"})
 			}
 			return err
 		}
@@ -402,7 +402,7 @@ func (sess *backupSession) readLoop(ctx context.Context) error {
 			sess.b.setSourceEpoch(m.Epoch)
 			return fmt.Errorf("%w: the source asks for a new snapshot: %s", ErrResyncRequired, m.Reason)
 		default:
-			sess.conn.writeMessage(Error{Code: CodeProtocol, Message: fmt.Sprintf("the message %s is not expected", t)})
+			_ = sess.conn.writeMessage(Error{Code: CodeProtocol, Message: fmt.Sprintf("the message %s is not expected", t)})
 			return fmt.Errorf("%w: the message %s is not expected", ErrInvalidFrame, t)
 		}
 	}
@@ -523,7 +523,7 @@ func (sess *backupSession) pause(ctx context.Context, appliedSeq uint64) error {
 
 // sendResync tells the source that a new snapshot is needed.
 func (sess *backupSession) sendResync(reason ResyncReason, epoch, seq uint64) {
-	sess.conn.writeMessage(ResyncRequired{Reason: reason, Epoch: epoch, Seq: seq})
+	_ = sess.conn.writeMessage(ResyncRequired{Reason: reason, Epoch: epoch, Seq: seq})
 }
 
 // backoffDelay returns the delay before the next connection attempt.

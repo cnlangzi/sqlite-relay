@@ -73,7 +73,7 @@ func (d *Driver) snapshotOnce(ctx context.Context, dst string) (*Snapshot, error
 	if err != nil {
 		return nil, fmt.Errorf("driver: open WAL: %w", err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	scan, err := reader.Scan()
 	if err != nil {
 		return nil, fmt.Errorf("driver: read WAL: %w", err)
@@ -194,7 +194,7 @@ func readBaseline(path string) (baseline, error) {
 	if err != nil {
 		return baseline{}, fmt.Errorf("driver: open database: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	// The change counter of page 1 sits at offset 24.
 	var head [28]byte
 	if _, err := io.ReadFull(f, head[:]); err != nil {
@@ -213,12 +213,12 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("driver: open %s: %w", src, err)
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 	out, err := os.Create(dst)
 	if err != nil {
 		return fmt.Errorf("driver: create %s: %w", dst, err)
 	}
-	defer out.Close()
+	defer func() { _ = out.Close() }()
 	if _, err := io.Copy(out, in); err != nil {
 		return fmt.Errorf("driver: copy %s: %w", src, err)
 	}
@@ -235,7 +235,7 @@ func applyPages(path, source string, pages map[uint32][]byte, commitPages uint32
 	if err != nil {
 		return fmt.Errorf("driver: open snapshot: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	for pgno, data := range pages {
 		offset := int64(pgno-1) * int64(pageSize)
 		if _, err := f.WriteAt(data, offset); err != nil {
@@ -267,7 +267,7 @@ func copyMissingPages(dst *os.File, source string, from, to int64, pageSize int)
 	if err != nil {
 		return fmt.Errorf("driver: open %s: %w", source, err)
 	}
-	defer src.Close()
+	defer func() { _ = src.Close() }()
 	info, err := src.Stat()
 	if err != nil {
 		return fmt.Errorf("driver: stat %s: %w", source, err)
@@ -300,7 +300,7 @@ func dbPageCount(path string) (uint32, error) {
 	if err != nil {
 		return 0, fmt.Errorf("driver: open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	var head [32]byte
 	if _, err := io.ReadFull(f, head[:]); err != nil {
 		return 0, fmt.Errorf("driver: read %s: %w", path, err)
@@ -320,7 +320,7 @@ func checkIntegrity(path string) error {
 	if err != nil {
 		return fmt.Errorf("driver: open snapshot: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	var result string
 	if err := db.QueryRow("PRAGMA integrity_check").Scan(&result); err != nil {
 		return fmt.Errorf("driver: integrity_check: %w", err)

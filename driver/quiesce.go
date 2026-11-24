@@ -140,7 +140,7 @@ func isWriteStatement(query string) bool {
 func withStatementIsWrite(query string) bool {
 	depth := 0
 	words := strings.FieldsFunc(query, func(r rune) bool {
-		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r == '_')
+		return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && r != '_'
 	})
 	for _, w := range words {
 		switch w {
