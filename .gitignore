@@ -32,3 +32,9 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Local index of the CodeGraph tool
+.codegraph
+
+# Workspace state of the gtw tooling
+.nightme/
