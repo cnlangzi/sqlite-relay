@@ -123,7 +123,7 @@ func (a *applier) check() error {
 	if err != nil {
 		return fmt.Errorf("backup: open the backup database: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return checkSize(f, a.st.PageSize)
 }
 

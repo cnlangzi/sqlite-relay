@@ -93,9 +93,8 @@ agent believes it is done.
 
 ### Local scope
 
-- `make test` — every package in the module.
-- `make test PKGS=./driver/...` — only the packages a change touches.
-- `make test-race PKGS=...` — for changes to concurrent code.
+- `make tests` — every package in the module, with the race detector.
+- `make tests PKGS=./driver/...` — only the packages a change touches.
 - `make lint` — formatting and golangci-lint; run `make tools` first
   when the linter is not installed.
 
@@ -126,3 +125,5 @@ Re-read the report as a reviewer with the same shell access but no
 session memory. Each evidence line must be reproducible: same
 command, same exit code, same output. If the reviewer cannot
 reproduce the evidence, the evidence is wrong.
+
+Run `make lint` and confirm that it exits 0.

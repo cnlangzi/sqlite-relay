@@ -116,7 +116,7 @@ func (p *Producer) Snapshot(ctx context.Context) (protocol.SnapshotMeta, io.Read
 			return meta, r, nil
 		}
 		if r != nil {
-			r.Close()
+			_ = r.Close()
 		}
 		if !errors.Is(err, errRetry) {
 			return protocol.SnapshotMeta{}, nil, err
@@ -152,7 +152,7 @@ func (p *Producer) snapshotOnce(ctx context.Context) (protocol.SnapshotMeta, io.
 	}
 	snap, err := p.drv.Snapshot(ctx, path)
 	if err != nil {
-		os.Remove(path)
+		_ = os.Remove(path)
 		return protocol.SnapshotMeta{}, nil, fmt.Errorf("snapshot: take the snapshot: %w", err)
 	}
 	boundary := snap.Pos
@@ -162,24 +162,24 @@ func (p *Producer) snapshotOnce(ctx context.Context) (protocol.SnapshotMeta, io.
 	// the chain ends at the boundary of the snapshot.
 	if ack.Seq > 0 {
 		if err := p.drain(ctx, ack, boundary); err != nil {
-			os.Remove(path)
+			_ = os.Remove(path)
 			return protocol.SnapshotMeta{}, nil, err
 		}
 		ack, err = p.sp.Durable()
 		if err != nil {
-			os.Remove(path)
+			_ = os.Remove(path)
 			return protocol.SnapshotMeta{}, nil, fmt.Errorf("snapshot: the durable acknowledgement of the spool: %w", err)
 		}
 	}
 
 	meta, err := p.meta(ctx, path, ack)
 	if err != nil {
-		os.Remove(path)
+		_ = os.Remove(path)
 		return protocol.SnapshotMeta{}, nil, err
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		os.Remove(path)
+		_ = os.Remove(path)
 		return protocol.SnapshotMeta{}, nil, fmt.Errorf("snapshot: open %s: %w", path, err)
 	}
 	return meta, &snapshotFile{path: path, file: file}, nil
@@ -195,7 +195,7 @@ func (p *Producer) snapshotPath() (string, error) {
 		return "", fmt.Errorf("snapshot: create a temporary file: %w", err)
 	}
 	path := f.Name()
-	f.Close()
+	_ = f.Close()
 	return path, nil
 }
 
@@ -270,7 +270,7 @@ func (p *Producer) meta(ctx context.Context, path string, ack spool.Ack) (protoc
 	if err != nil {
 		return protocol.SnapshotMeta{}, fmt.Errorf("snapshot: open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	var head [headerSize]byte
 	if _, err := f.ReadAt(head[:], 0); err != nil {
 		return protocol.SnapshotMeta{}, fmt.Errorf("snapshot: read the header of %s: %w", path, err)
@@ -314,6 +314,6 @@ func (s *snapshotFile) Read(p []byte) (int, error) {
 // Close closes the file of the snapshot and removes it.
 func (s *snapshotFile) Close() error {
 	err := s.file.Close()
-	os.Remove(s.path)
+	_ = os.Remove(s.path)
 	return err
 }

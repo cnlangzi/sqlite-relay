@@ -72,24 +72,24 @@ func (a *applier) CommitSnapshot(ctx context.Context) error {
 		return errors.New("backup: no snapshot was received")
 	}
 	a.snap = nil
-	defer s.file.Close()
+	defer func() { _ = s.file.Close() }()
 	if a.paused {
 		// The business reads the backup database, it may not be replaced
 		// under its feet.
-		os.Remove(s.path)
+		_ = os.Remove(s.path)
 		return errors.New("backup: the backup is paused, the snapshot is not installed")
 	}
 
 	if s.bytes != s.meta.Bytes {
-		os.Remove(s.path)
+		_ = os.Remove(s.path)
 		return fmt.Errorf("backup: the snapshot holds %d bytes, the manifest says %d", s.bytes, s.meta.Bytes)
 	}
 	if !bytes.Equal(s.hash.Sum(nil), s.meta.Checksum[:]) {
-		os.Remove(s.path)
+		_ = os.Remove(s.path)
 		return errors.New("backup: the checksum of the snapshot does not match the manifest")
 	}
 	if s.meta.PageSize == 0 {
-		os.Remove(s.path)
+		_ = os.Remove(s.path)
 		return fmt.Errorf("%w: the manifest of the snapshot names no page size", ErrPageSize)
 	}
 	info, err := s.file.Stat()
@@ -97,12 +97,12 @@ func (a *applier) CommitSnapshot(ctx context.Context) error {
 		return fmt.Errorf("backup: stat %s: %w", s.path, err)
 	}
 	if info.Size()%int64(s.meta.PageSize) != 0 {
-		os.Remove(s.path)
+		_ = os.Remove(s.path)
 		return fmt.Errorf("%w: the snapshot is %d bytes long, the page size is %d", ErrPageSize, info.Size(), s.meta.PageSize)
 	}
 	pages := uint32(info.Size() / int64(s.meta.PageSize))
 	if err := normalizeHeader(s.file, pages); err != nil {
-		os.Remove(s.path)
+		_ = os.Remove(s.path)
 		return err
 	}
 	if err := s.file.Sync(); err != nil {
@@ -110,7 +110,7 @@ func (a *applier) CommitSnapshot(ctx context.Context) error {
 	}
 	if a.verify {
 		if err := checkIntegrity(s.path); err != nil {
-			os.Remove(s.path)
+			_ = os.Remove(s.path)
 			return err
 		}
 	}
@@ -205,7 +205,7 @@ func recoverInstall(dir, dbPath, statePath string, st *state) error {
 	if st.Phase != PhaseInstalling {
 		// The temporary file of an installation that was not started is
 		// left over, it is not a database.
-		os.Remove(dbPath + ".new")
+		_ = os.Remove(dbPath + ".new")
 		return nil
 	}
 	tmp := dbPath + ".new"
@@ -243,7 +243,7 @@ func fileChecksum(path string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("backup: open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return nil, fmt.Errorf("backup: read %s: %w", path, err)
@@ -257,7 +257,7 @@ func checkIntegrity(path string) error {
 	if err != nil {
 		return fmt.Errorf("backup: open the backup database: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	var result string
 	if err := db.QueryRow("PRAGMA integrity_check").Scan(&result); err != nil {
 		return fmt.Errorf("backup: integrity_check: %w", err)
