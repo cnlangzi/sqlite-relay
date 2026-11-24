@@ -198,6 +198,23 @@ func TestBackupResumesAfterPause(t *testing.T) {
 	}
 }
 
+func TestBackupDoesNotStartAHeartbeatStorm(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.BackoffMin = 20 * time.Millisecond
+	cfg.HeartbeatInterval = 50 * time.Millisecond
+	src := &fakeSource{}
+	addr, _, _ := startSource(t, cfg, src)
+	proxy := newTestProxy(t, addr)
+	startBackup(t, cfg, &fakeSink{}, proxy.addr())
+
+	// The two sides send a heartbeat every interval, they do not answer
+	// the heartbeat of the peer: an answer would bounce between them.
+	time.Sleep(time.Second)
+	if n := proxy.count(); n > 16<<10 {
+		t.Errorf("the traffic of the connection is %d bytes in a second, want less than %d", n, 16<<10)
+	}
+}
+
 func TestBackupReconnectsWithGrowingDelay(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.BackoffMin = 50 * time.Millisecond
@@ -316,6 +333,54 @@ func TestBackupReconnectsWithTheAppliedSequence(t *testing.T) {
 	}
 	if hello.AppliedSeq != 3 {
 		t.Errorf("the hello names the sequence number %d, want 3", hello.AppliedSeq)
+	}
+}
+
+func TestBackupKeepsThePauseAfterTheReconnect(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.BackoffMin = 20 * time.Millisecond
+	srv := newTestServer(t, cfg)
+	b := startBackup(t, cfg, &fakeSink{}, srv.addr())
+
+	if !waitFor(t, 5*time.Second, func() bool { return srv.helloCount() == 1 }) {
+		t.Fatal("the backup did not connect")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := b.Pause(ctx, 0); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+
+	// The connection breaks, the backup opens it again and pauses the
+	// source again.
+	srv.closeConns()
+	if !waitFor(t, 5*time.Second, func() bool { return srv.helloCount() == 2 }) {
+		t.Fatal("the backup did not connect again")
+	}
+	if !waitFor(t, 5*time.Second, func() bool { return slices.Contains(srv.types(), MsgPause) }) {
+		t.Fatalf("the backup sent %v, want a pause", srv.types())
+	}
+}
+
+func TestBackupReportsTheEpochOfTheSource(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.BackoffMin = 20 * time.Millisecond
+	src := &fakeSource{}
+	src.setEpoch(3)
+	sink := &fakeSink{}
+	b, err := NewBackup(cfg, sink)
+	if err != nil {
+		t.Fatalf("NewBackup: %v", err)
+	}
+	addr, _, _ := startSource(t, cfg, src)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx, addr)
+
+	// The source refuses the hello of the backup, the resync names the
+	// generation of the chain the source is part of.
+	if !waitFor(t, 5*time.Second, func() bool { return b.Epoch() == 3 }) {
+		t.Errorf("the backup knows the epoch %d, want 3", b.Epoch())
 	}
 }
 

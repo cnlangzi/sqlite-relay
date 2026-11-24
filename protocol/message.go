@@ -439,7 +439,7 @@ func (r *reader) fixed(n int) []byte {
 	if r.err != nil {
 		return nil
 	}
-	if len(r.b) < n {
+	if n < 0 || len(r.b) < n {
 		r.err = fmt.Errorf("%w: the message is too short", ErrInvalidMessage)
 		return nil
 	}
@@ -510,14 +510,19 @@ func decodeBatch(payload []byte) (Batch, error) {
 	var m Batch
 	r := newReader(payload)
 	for len(r.b) > 0 {
-		n := int(r.u32())
+		n := r.u32()
 		if r.err != nil {
 			return m, r.err
 		}
 		if n == 0 {
 			return m, fmt.Errorf("%w: the batch holds a segment without bytes", ErrInvalidMessage)
 		}
-		m.Segments = append(m.Segments, r.fixed(n))
+		// The length is compared before it is turned into an int, a
+		// length that does not fit into an int would cut the payload.
+		if uint64(n) > uint64(len(r.b)) {
+			return m, fmt.Errorf("%w: the batch holds a segment of %d bytes, %d bytes are left", ErrInvalidMessage, n, len(r.b))
+		}
+		m.Segments = append(m.Segments, r.fixed(int(n)))
 	}
 	if err := r.done(); err != nil {
 		return m, err

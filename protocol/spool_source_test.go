@@ -58,7 +58,7 @@ func TestSpoolSourceServesTheSegmentsOfTheSpool(t *testing.T) {
 		t.Errorf("the lowest sequence number is %d, want %d", src.OldestSeq(), refs[0].SeqStart)
 	}
 
-	segs, err := src.SegmentsAfter(ctx, 0)
+	segs, err := src.SegmentsAfter(ctx, 0, 1<<20)
 	if err != nil {
 		t.Fatalf("SegmentsAfter: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestSpoolSourceServesTheSegmentsOfTheSpool(t *testing.T) {
 		t.Error("the segment does not hold the bytes of the file of the spool")
 	}
 
-	segs, err = src.SegmentsAfter(ctx, refs[0].SeqEnd)
+	segs, err = src.SegmentsAfter(ctx, refs[0].SeqEnd, 1<<20)
 	if err != nil {
 		t.Fatalf("SegmentsAfter: %v", err)
 	}

@@ -3,6 +3,7 @@ package protocol
 import (
 	"bytes"
 	"testing"
+	"time"
 )
 
 func TestConfigValidation(t *testing.T) {
@@ -25,6 +26,15 @@ func TestConfigValidation(t *testing.T) {
 	cfg.DatabaseID = ""
 	if _, err := NewBackup(cfg, &fakeSink{}); err == nil {
 		t.Error("a backup without a database was accepted")
+	}
+
+	// A connection that dies before the first heartbeat is not a
+	// configuration that works.
+	cfg = testConfig(t)
+	cfg.HeartbeatInterval = 10 * time.Second
+	cfg.IdleTimeout = 5 * time.Second
+	if _, err := NewSource(cfg, &fakeSource{}); err == nil {
+		t.Error("a source with an idle timeout below the heartbeat interval was accepted")
 	}
 
 	// A name of a backup that does not fit into the hello is refused

@@ -42,8 +42,10 @@ func (s *SpoolSource) OldestSeq() uint64 {
 // after seq.
 //
 // The bytes of a segment are read from the file of the segment, the segment
-// is never changed and it is never written again.
-func (s *SpoolSource) SegmentsAfter(ctx context.Context, seq uint64) ([]Segment, error) {
+// is never changed and it is never written again. The segments hold at most
+// limit bytes, so that the source does not read the whole queue of the spool
+// again for every batch it sends.
+func (s *SpoolSource) SegmentsAfter(ctx context.Context, seq uint64, limit int64) ([]Segment, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -52,9 +54,13 @@ func (s *SpoolSource) SegmentsAfter(ctx context.Context, seq uint64) ([]Segment,
 		return nil, err
 	}
 	var out []Segment
+	size := int64(0)
 	for _, ref := range refs {
 		if ref.SeqEnd <= seq {
 			continue
+		}
+		if len(out) > 0 && size+ref.Bytes > limit {
+			break
 		}
 		b, err := os.ReadFile(ref.Path)
 		if err != nil {
@@ -66,6 +72,7 @@ func (s *SpoolSource) SegmentsAfter(ctx context.Context, seq uint64) ([]Segment,
 			Epoch:    ref.Epoch,
 			Bytes:    b,
 		})
+		size += int64(len(b))
 	}
 	return out, nil
 }

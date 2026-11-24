@@ -3,10 +3,12 @@ package protocol
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func TestTokenIsReadForEveryHandshake(t *testing.T) {
 	cfg := testConfig(t)
+	cfg.HeartbeatInterval = 50 * time.Millisecond
 	src := &fakeSource{}
 	addr, _, _ := startSource(t, cfg, src)
 
@@ -25,14 +27,14 @@ func TestTokenIsReadForEveryHandshake(t *testing.T) {
 		t.Fatalf("write the token: %v", err)
 	}
 
-	// The connection that is open keeps the token it proved itself with.
-	old.write(Heartbeat{UnixMillis: 1})
-	typ, _, err = old.read()
+	// The connection that is open keeps the token it proved itself with,
+	// the source still talks on it.
+	typ, _, err = old.readWithin(5 * time.Second)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
 	if typ != MsgHeartbeat {
-		t.Errorf("the source answered %s, want HEARTBEAT", typ)
+		t.Errorf("the source sent %s, want HEARTBEAT", typ)
 	}
 	old.conn.Close()
 

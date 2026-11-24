@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +26,8 @@ type fakeSource struct {
 	mu       sync.Mutex
 	epoch    uint64
 	segments []Segment
+	served   int64
+	calls    int
 }
 
 // Epoch returns the generation of the chain.
@@ -45,17 +48,34 @@ func (f *fakeSource) OldestSeq() uint64 {
 }
 
 // SegmentsAfter returns the segments that hold a transaction after seq.
-func (f *fakeSource) SegmentsAfter(ctx context.Context, seq uint64) ([]Segment, error) {
+//
+// The segments hold at most limit bytes, like the segment source of the
+// spool.
+func (f *fakeSource) SegmentsAfter(ctx context.Context, seq uint64, limit int64) ([]Segment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []Segment
+	size := int64(0)
 	for _, s := range f.segments {
 		if s.SeqEnd <= seq {
 			continue
 		}
+		if len(out) > 0 && size+int64(len(s.Bytes)) > limit {
+			break
+		}
 		out = append(out, s)
+		size += int64(len(s.Bytes))
 	}
+	f.served += size
+	f.calls++
 	return out, nil
+}
+
+// servedBytes returns the number of bytes the source handed out.
+func (f *fakeSource) servedBytes() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.served
 }
 
 // add puts segments into the source.
@@ -468,6 +488,70 @@ func (s *testServer) types() []MessageType {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]MessageType(nil), s.received...)
+}
+
+// testProxy forwards the traffic of the backup to the source and counts the
+// bytes that flow through it.
+type testProxy struct {
+	ln    net.Listener
+	bytes atomic.Int64
+}
+
+// newTestProxy starts a proxy in front of the address.
+func newTestProxy(t *testing.T, addr string) *testProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	p := &testProxy{ln: ln}
+	t.Cleanup(func() { ln.Close() })
+	go p.serve(addr)
+	return p
+}
+
+// serve forwards the connections of the backup to the source.
+func (p *testProxy) serve(addr string) {
+	for {
+		c, err := p.ln.Accept()
+		if err != nil {
+			return
+		}
+		up, err := net.Dial("tcp", addr)
+		if err != nil {
+			c.Close()
+			return
+		}
+		go p.forward(up, c)
+		go p.forward(c, up)
+	}
+}
+
+// forward copies the bytes of one direction into the other.
+func (p *testProxy) forward(dst, src net.Conn) {
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			p.bytes.Add(int64(n))
+			if _, err := dst.Write(buf[:n]); err != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// addr returns the address of the proxy.
+func (p *testProxy) addr() string {
+	return p.ln.Addr().String()
+}
+
+// count returns the number of bytes that flowed through the proxy.
+func (p *testProxy) count() int64 {
+	return p.bytes.Load()
 }
 
 // waitFor waits until the condition holds or the timeout is over.

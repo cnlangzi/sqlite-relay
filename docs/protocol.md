@@ -179,7 +179,13 @@ when the bytes in flight reach the limit and continues when the backup
 acknowledges or when the backup sends a bigger limit.
 
 The source has a limit of its own, 8MB by default. It is the limit that
-applies until the backup sends a `FLOW_CONTROL`.
+applies until the backup sends a `FLOW_CONTROL`. A batch never holds more
+than the window allows, so the bytes in flight stay below the limit. A
+segment that is bigger than the window is sent anyway, it is not cut.
+
+A limit of zero stops the source until the backup sends a bigger limit. A
+limit that does not fit into an int is clamped, a peer cannot open the
+window of the source by accident.
 
 ## The pause
 
@@ -187,6 +193,14 @@ applies until the backup sends a `FLOW_CONTROL`.
 connection, it stops sending segments and answers with a `PAUSED` that names
 the last sequence number it sent. `Pause` waits for that answer and it is
 idempotent: a pause that is already running returns without an error.
+
+The answer comes from the side that sends the segments: no segment follows
+the `PAUSED`. A caller that pauses before it reads the backup database may
+rely on that.
+
+The pause survives a broken connection. The backup pauses the source again
+as soon as the connection is open, and a pause that is asked for while the
+backup is not connected is remembered.
 
 `Resume` tells the source to push again. The source continues after the
 sequence number the backup names.
@@ -198,18 +212,34 @@ the protocol.
 
 ## The heartbeat and the timeout
 
-Both sides send a `HEARTBEAT` every 5 seconds and answer the heartbeat of
-the peer with a heartbeat of their own. A connection that stays silent for
-30 seconds is closed: the peer is gone or the network is broken.
+Both sides send a `HEARTBEAT` every 5 seconds. A heartbeat is not answered:
+the peer sends its own, an answer would only bounce between the two sides. A
+connection that stays silent for 30 seconds is closed: the peer is gone or the
+network is broken. The idle timeout has to be at least twice the heartbeat
+interval, a connection that dies before the first heartbeat is not a
+connection.
+
+## The epoch
+
+The epoch names the generation of the chain. It belongs to the durable
+applied sequence of the backup: a backup that changes the epoch of its
+applied sequence needs a new snapshot, and a backup that keeps the epoch of a
+snapshot takes the increments of that chain again.
+
+The backup sends the epoch of its applied sequence in the hello. The source
+refuses a hello of another generation of the chain with a `RESYNC_REQUIRED`
+that names the epoch of the source. `Backup.Epoch` returns that epoch, so
+that the caller keeps it together with the applied sequence of the sink.
 
 ## The reconnection
 
 The backup opens the connection, because the applied sequence and the pause
 live on its side. A connection that breaks is opened again with a delay that
 starts at one second, doubles with every attempt and stops at one minute.
-The delay carries a jitter, so that the backups of a deployment do not
-reconnect at the same time. A connection that lived longer than a heartbeat
-starts the delay over.
+The delay carries a jitter of up to half of the delay, so that the backups of
+a deployment do not reconnect at the same time. The delay never grows beyond
+the maximum. A connection that lived longer than a heartbeat starts the delay
+over.
 
 A backup that needs a new snapshot stops: the run ends with
 `ErrResyncRequired` and the errors of the package can be matched with
@@ -225,7 +255,7 @@ to a `SegmentSink`:
 type SegmentSource interface {
 	Epoch() uint64
 	OldestSeq() uint64
-	SegmentsAfter(ctx context.Context, seq uint64) ([]Segment, error)
+	SegmentsAfter(ctx context.Context, seq uint64, limit int64) ([]Segment, error)
 }
 
 type SegmentSink interface {
@@ -237,6 +267,10 @@ type SegmentSink interface {
 `SpoolSource` in `spool_source.go` is the adapter of the spool. It takes the
 segments that the spool published, it never sends a segment that waits for
 the barrier of the spool.
+
+The limit of `SegmentsAfter` names the number of bytes the source may send at
+the moment. The source asks for the segments it can send, so that a segment
+of the spool is read once and not once per batch.
 
 The source accepts the connections:
 
@@ -264,6 +298,7 @@ serve with `ErrResyncRequired`.
 | `DatabaseID` | | the name of the database the segments belong to |
 | `StreamID` | | the number of the stream |
 | `BackupID` | | the name of the backup, the source checks it against its list |
+| `Epoch` | | the generation of the chain the backup belongs to |
 | `AllowedBackups` | | the backups that may connect, every backup when the list is empty |
 | `HeartbeatInterval` | 5s | the time between two heartbeats |
 | `IdleTimeout` | 30s | the time a connection may stay silent |
@@ -281,6 +316,12 @@ The source serves one connection at a time and the list of the backups that
 may connect holds the names of the backups of the deployment. Several
 backups that push at the same time and the distribution of the segments
 among them are not part of the protocol.
+
+### A spool that is broken
+
+A spool whose chain is broken ends the session of every connection: the
+segments of the spool cannot be read. The source keeps accepting, the
+operator resets the spool and takes a new snapshot.
 
 ### A backup that is behind the source
 

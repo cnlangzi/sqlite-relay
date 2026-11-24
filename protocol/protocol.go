@@ -29,7 +29,6 @@ const (
 	defaultHeartbeatInterval = 5 * time.Second
 	defaultIdleTimeout       = 30 * time.Second
 	defaultMaxBatchBytes     = 16 << 20
-	defaultMaxFrameBytes     = 64 << 20
 	defaultMaxUnackedBytes   = 8 << 20
 	defaultBackoffMin        = time.Second
 	defaultBackoffMax        = 60 * time.Second
@@ -61,6 +60,11 @@ type Config struct {
 	// BackupID is the name of the backup. The source checks the name
 	// against the list of the backups that may connect.
 	BackupID string
+	// Epoch is the generation of the chain the backup belongs to. It is
+	// the epoch of the applied sequence of the sink. A backup that
+	// belongs to another generation of the chain is refused by the
+	// source.
+	Epoch uint64
 	// AllowedBackups holds the identifiers of the backups that may connect.
 	// An empty list allows every backup that knows the token.
 	AllowedBackups []string
@@ -95,7 +99,7 @@ func (c Config) withDefaults() Config {
 		c.MaxBatchBytes = defaultMaxBatchBytes
 	}
 	if c.MaxFrameBytes <= 0 {
-		c.MaxFrameBytes = defaultMaxFrameBytes
+		c.MaxFrameBytes = MaxFrameBytes
 	}
 	if c.MaxUnackedBytes <= 0 {
 		c.MaxUnackedBytes = defaultMaxUnackedBytes
@@ -123,6 +127,11 @@ func (c Config) validate() error {
 	if len(c.BackupID) > MaxBackupIDLen {
 		return fmt.Errorf("protocol: the name of the backup is %d bytes long, the limit is %d bytes", len(c.BackupID), MaxBackupIDLen)
 	}
+	// The peer sends a heartbeat every heartbeat interval, the connection
+	// has to survive a heartbeat that is late.
+	if c.IdleTimeout < 2*c.HeartbeatInterval {
+		return fmt.Errorf("protocol: the idle timeout of %s is shorter than twice the heartbeat interval of %s", c.IdleTimeout, c.HeartbeatInterval)
+	}
 	return nil
 }
 
@@ -137,8 +146,14 @@ type SegmentSource interface {
 	// provide. It is zero when the source holds no segment.
 	OldestSeq() uint64
 	// SegmentsAfter returns the published segments that hold a transaction
-	// after seq, ordered by the sequence number of their first transaction.
-	SegmentsAfter(ctx context.Context, seq uint64) ([]Segment, error)
+	// after seq, ordered by the sequence number of their first
+	// transaction.
+	//
+	// The segments hold at most limit bytes. A segment that does not fit
+	// into the limit is returned anyway, the source sends it in a batch of
+	// its own. The source asks for the segments it can send at the moment,
+	// so that a segment is read once and not once per batch.
+	SegmentsAfter(ctx context.Context, seq uint64, limit int64) ([]Segment, error)
 }
 
 // Segment is a segment the source pushes.

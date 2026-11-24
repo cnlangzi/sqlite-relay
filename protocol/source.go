@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"slices"
 	"sync"
@@ -133,15 +134,23 @@ type sourceSession struct {
 	src  *Source
 	conn *conn
 
-	mu       sync.Mutex
-	applied  uint64
-	limit    int64
-	unacked  int64
-	pending  []inflight
-	paused   bool
-	sent     uint64
-	lastSent uint64
-	err      error
+	mu        sync.Mutex
+	applied   uint64
+	epoch     uint64
+	limit     int64
+	unacked   int64
+	pending   []inflight
+	paused    bool
+	pausedAck bool
+	sent      uint64
+	fetched   uint64
+	lastSent  uint64
+	err       error
+	resync    error
+
+	// resetQueue tells the send loop that the segments it fetched are
+	// not the ones the source continues with.
+	resetQueue bool
 
 	cancel context.CancelFunc
 	once   sync.Once
@@ -202,12 +211,23 @@ func (sess *sourceSession) finish(err error) {
 		sess.conn.Close()
 		close(sess.done)
 	})
+	// A resync matters more than an error of the transport: the peer may
+	// close the connection while the message that asks for the snapshot is
+	// read, and the write of the answer may fail first.
+	if errors.Is(err, ErrResyncRequired) {
+		sess.mu.Lock()
+		sess.resync = err
+		sess.mu.Unlock()
+	}
 }
 
 // errLocked returns the error the session ended with.
 func (sess *sourceSession) errLocked() error {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
+	if sess.resync != nil {
+		return sess.resync
+	}
 	if sess.err == nil {
 		return errSessionEnded
 	}
@@ -285,7 +305,9 @@ func (sess *sourceSession) handshake() error {
 	}
 	sess.mu.Lock()
 	sess.applied = hello.AppliedSeq
+	sess.epoch = epoch
 	sess.sent = hello.AppliedSeq
+	sess.fetched = hello.AppliedSeq
 	sess.limit = sess.src.cfg.MaxUnackedBytes
 	sess.mu.Unlock()
 	return nil
@@ -325,9 +347,7 @@ func (sess *sourceSession) readLoop(ctx context.Context) error {
 				sess.sendError(CodeProtocol, "the pause is malformed")
 				return err
 			}
-			if err := sess.onPause(m); err != nil {
-				return err
-			}
+			sess.onPause(m)
 		case MsgResume:
 			m, err := decodeResume(payload)
 			if err != nil {
@@ -340,9 +360,8 @@ func (sess *sourceSession) readLoop(ctx context.Context) error {
 				sess.sendError(CodeProtocol, "the heartbeat is malformed")
 				return err
 			}
-			if err := sess.conn.writeMessage(Heartbeat{UnixMillis: uint64(time.Now().UnixMilli())}); err != nil {
-				return err
-			}
+			// The heartbeat is not answered. Both sides send their own,
+			// an answer would only bounce between them.
 		case MsgError:
 			m, _ := decodeError(payload)
 			return fmt.Errorf("protocol: the backup sent an error: %s", m.Message)
@@ -358,34 +377,79 @@ func (sess *sourceSession) readLoop(ctx context.Context) error {
 
 // sendLoop pushes the segments of the source.
 func (sess *sourceSession) sendLoop(ctx context.Context) error {
+	// The queue holds the segments that were fetched and that were not
+	// sent yet. They are fetched once and not once per batch.
+	var queue []Segment
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		sess.mu.Lock()
 		paused := sess.paused
+		pausedAck := sess.pausedAck
 		limit := sess.limit
 		unacked := sess.unacked
 		sent := sess.sent
+		fetched := sess.fetched
+		reset := sess.resetQueue
 		sess.mu.Unlock()
 
-		if paused || unacked >= limit {
+		if paused {
+			// The answer is sent here and not in the read loop: the send
+			// loop is the only party that knows that no batch follows it.
+			if !pausedAck {
+				sess.mu.Lock()
+				last := sess.lastSent
+				sess.pausedAck = true
+				sess.mu.Unlock()
+				if err := sess.conn.writeMessage(Paused{LastSentSeq: last}); err != nil {
+					return err
+				}
+			}
 			if err := sess.wait(ctx, pollInterval); err != nil {
 				return err
 			}
 			continue
 		}
-		segs, err := sess.src.src.SegmentsAfter(ctx, sent)
-		if err != nil {
-			return err
+		if reset {
+			// The backup asked the source to continue after a sequence
+			// number, the segments that were fetched are fetched again.
+			sess.mu.Lock()
+			sess.resetQueue = false
+			sess.mu.Unlock()
+			queue = nil
+			fetched = sent
 		}
-		if len(segs) == 0 {
+
+		// The batch never holds more than the window of the backup
+		// allows, so that the bytes in flight stay below the limit.
+		budget := sess.src.cfg.MaxBatchBytes
+		if room := limit - unacked; room < budget {
+			budget = room
+		}
+		if budget <= 0 {
 			if err := sess.wait(ctx, pollInterval); err != nil {
 				return err
 			}
 			continue
 		}
-		chosen, batch, err := packBatch(segs, sess.src.cfg.MaxBatchBytes, sess.src.cfg.MaxFrameBytes)
+		if len(queue) == 0 {
+			segs, err := sess.src.src.SegmentsAfter(ctx, fetched, budget)
+			if err != nil {
+				return err
+			}
+			if len(segs) == 0 {
+				if err := sess.wait(ctx, pollInterval); err != nil {
+					return err
+				}
+				continue
+			}
+			queue = segs
+			sess.mu.Lock()
+			sess.fetched = segs[len(segs)-1].SeqEnd
+			sess.mu.Unlock()
+		}
+		chosen, batch, err := packBatch(queue, budget, sess.src.cfg.MaxFrameBytes)
 		if err != nil {
 			return err
 		}
@@ -393,6 +457,7 @@ func (sess *sourceSession) sendLoop(ctx context.Context) error {
 			return err
 		}
 		sess.advance(sent, chosen)
+		queue = queue[len(chosen):]
 	}
 }
 
@@ -435,6 +500,12 @@ func (sess *sourceSession) heartbeatLoop(ctx context.Context) error {
 
 // onAck records the sequence number the backup applied.
 func (sess *sourceSession) onAck(m Ack) {
+	if m.Epoch != sess.epoch {
+		// The backup is part of another generation of the chain, the
+		// sequence numbers of the two do not mean the same thing.
+		sess.sendResync(ResyncEpochMismatch, m.Epoch, m.AppliedSeq)
+		return
+	}
 	sess.mu.Lock()
 	if m.AppliedSeq > sess.applied {
 		sess.applied = m.AppliedSeq
@@ -447,29 +518,41 @@ func (sess *sourceSession) onAck(m Ack) {
 }
 
 // onFlowControl records the limit of the bytes in flight.
+//
+// The limit is clamped, a peer that names a limit that does not fit into an
+// int does not open the window of the source.
 func (sess *sourceSession) onFlowControl(m FlowControl) {
+	limit := int64(m.MaxUnackedBytes)
+	if limit < 0 || limit > math.MaxInt32 {
+		limit = math.MaxInt32
+	}
 	sess.mu.Lock()
-	sess.limit = int64(m.MaxUnackedBytes)
+	sess.limit = limit
 	sess.mu.Unlock()
 	sess.wakeup()
 }
 
-// onPause stops the push of segments and answers the backup.
-func (sess *sourceSession) onPause(m Pause) error {
+// onPause stops the push of segments.
+//
+// The answer is not sent here: the send loop is the only party that knows
+// that no batch follows the answer.
+func (sess *sourceSession) onPause(m Pause) {
 	sess.mu.Lock()
 	sess.paused = true
-	last := sess.lastSent
+	sess.pausedAck = false
 	sess.pending, sess.unacked = dropAcked(sess.pending, sess.unacked, m.AppliedSeq)
 	sess.mu.Unlock()
 	sess.wakeup()
-	return sess.conn.writeMessage(Paused{LastSentSeq: last})
 }
 
 // onResume starts the push of segments again.
 func (sess *sourceSession) onResume(m Resume) {
 	sess.mu.Lock()
 	sess.paused = false
+	sess.pausedAck = false
 	sess.sent = m.AppliedSeq
+	sess.fetched = m.AppliedSeq
+	sess.resetQueue = true
 	sess.pending, sess.unacked = dropAcked(sess.pending, sess.unacked, m.AppliedSeq)
 	sess.mu.Unlock()
 	sess.wakeup()

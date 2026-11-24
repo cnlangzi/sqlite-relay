@@ -22,11 +22,14 @@ type Backup struct {
 	cfg  Config
 	sink SegmentSink
 
-	mu      sync.Mutex
-	epoch   uint64
-	sess    *backupSession
-	paused  bool
-	lastErr error
+	mu       sync.Mutex
+	sess     *backupSession
+	paused   bool
+	pauseSeq uint64
+	lastErr  error
+
+	// sourceEpoch is the generation of the chain the source is part of.
+	sourceEpoch uint64
 
 	pauseMu sync.Mutex
 }
@@ -80,6 +83,24 @@ func (b *Backup) Run(ctx context.Context, addr string) error {
 	}
 }
 
+// Epoch returns the generation of the chain the source is part of.
+//
+// It is zero when the source did not tell the epoch yet. The backup belongs
+// to the epoch of the applied sequence of its sink, the caller keeps both
+// together.
+func (b *Backup) Epoch() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sourceEpoch
+}
+
+// setSourceEpoch records the generation of the chain the source is part of.
+func (b *Backup) setSourceEpoch(epoch uint64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sourceEpoch = epoch
+}
+
 // LastError returns the error the last connection ended with.
 func (b *Backup) LastError() error {
 	b.mu.Lock()
@@ -90,7 +111,9 @@ func (b *Backup) LastError() error {
 // Pause asks the source to stop pushing segments.
 //
 // The call waits for the answer of the source. A pause that is already
-// running returns without an error.
+// running returns without an error. A pause that is asked for while the
+// backup is not connected is remembered, the source is paused again as soon
+// as the connection is open.
 func (b *Backup) Pause(ctx context.Context, appliedSeq uint64) error {
 	b.pauseMu.Lock()
 	defer b.pauseMu.Unlock()
@@ -102,29 +125,37 @@ func (b *Backup) Pause(ctx context.Context, appliedSeq uint64) error {
 	sess := b.sess
 	b.mu.Unlock()
 	if sess == nil {
-		return errors.New("protocol: the backup is not connected")
+		b.mu.Lock()
+		b.paused = true
+		b.pauseSeq = appliedSeq
+		b.mu.Unlock()
+		return nil
 	}
 	if err := sess.pause(ctx, appliedSeq); err != nil {
 		return err
 	}
 	b.mu.Lock()
 	b.paused = true
+	b.pauseSeq = appliedSeq
 	b.mu.Unlock()
 	return nil
 }
 
 // Resume tells the source to push segments again.
 //
-// The source continues after the sequence number the backup names.
+// The source continues after the sequence number the backup names. A resume
+// that is asked for while the backup is not connected clears the pause, the
+// source pushes again with the connection that is opened next.
 func (b *Backup) Resume(ctx context.Context, appliedSeq uint64) error {
 	b.pauseMu.Lock()
 	defer b.pauseMu.Unlock()
 	b.mu.Lock()
 	sess := b.sess
 	b.paused = false
+	b.pauseSeq = appliedSeq
 	b.mu.Unlock()
 	if sess == nil {
-		return errors.New("protocol: the backup is not connected")
+		return nil
 	}
 	return sess.conn.writeMessage(Resume{AppliedSeq: appliedSeq})
 }
@@ -173,17 +204,32 @@ func (b *Backup) runSession(ctx context.Context, addr string) (bool, error) {
 		defer wg.Done()
 		sess.finish(sess.heartbeatLoop(sctx))
 	}()
+
+	// The source is paused again when the connection was opened while the
+	// backup was paused.
+	sess.b.mu.Lock()
+	paused := sess.b.paused
+	pauseSeq := sess.b.pauseSeq
+	sess.b.mu.Unlock()
+	if paused {
+		if err := sess.pause(sctx, pauseSeq); err != nil {
+			sess.finish(err)
+		}
+	}
+
 	wg.Wait()
 	return true, sess.errLocked()
 }
 
 // clearSession forgets the session when it is over.
+//
+// The pause stays: the source is paused again as soon as the connection is
+// open again.
 func (b *Backup) clearSession(sess *backupSession) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.sess == sess {
 		b.sess = nil
-		b.paused = false
 	}
 }
 
@@ -196,6 +242,7 @@ type backupSession struct {
 	applied uint64
 	epoch   uint64
 	err     error
+	resync  error
 
 	cancel   context.CancelFunc
 	once     sync.Once
@@ -218,14 +265,11 @@ func (sess *backupSession) handshake(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	sess.b.mu.Lock()
-	epoch := sess.b.epoch
-	sess.b.mu.Unlock()
 	hello := Hello{
 		ProtocolVersion: ProtocolVersion,
 		DatabaseID:      segment.DatabaseID(sess.b.cfg.DatabaseID),
 		StreamID:        sess.b.cfg.StreamID,
-		Epoch:           epoch,
+		Epoch:           sess.b.cfg.Epoch,
 		BackupID:        sess.b.cfg.BackupID,
 		AppliedSeq:      applied,
 		Nonce:           nonce,
@@ -242,6 +286,7 @@ func (sess *backupSession) handshake(ctx context.Context) error {
 	case MsgHelloAck:
 	case MsgResyncRequired:
 		m, _ := decodeResyncRequired(payload)
+		sess.b.setSourceEpoch(m.Epoch)
 		return fmt.Errorf("%w: the source asks for a new snapshot: %s", ErrResyncRequired, m.Reason)
 	case MsgError:
 		m, _ := decodeError(payload)
@@ -259,12 +304,15 @@ func (sess *backupSession) handshake(ctx context.Context) error {
 	if !macEqual(ack.MAC, serverMAC(token, nonce, ack.Nonce, ack.macPrefix())) {
 		return errors.New("protocol: the token does not match")
 	}
+	if ack.ResumeSeq != hello.AppliedSeq {
+		return fmt.Errorf("protocol: the source continues after %d, the backup applied %d", ack.ResumeSeq, hello.AppliedSeq)
+	}
 	sess.mu.Lock()
 	sess.applied = applied
 	sess.epoch = ack.Epoch
 	sess.mu.Unlock()
 	sess.b.mu.Lock()
-	sess.b.epoch = ack.Epoch
+	sess.b.sourceEpoch = ack.Epoch
 	sess.b.sess = sess
 	sess.b.mu.Unlock()
 	return sess.conn.writeMessage(FlowControl{MaxUnackedBytes: uint64(sess.b.cfg.MaxUnackedBytes)})
@@ -286,12 +334,23 @@ func (sess *backupSession) finish(err error) {
 		sess.conn.Close()
 		close(sess.done)
 	})
+	// A resync matters more than an error of the transport: the peer may
+	// close the connection while the message that asks for the snapshot is
+	// read, and the write of the answer may fail first.
+	if errors.Is(err, ErrResyncRequired) {
+		sess.mu.Lock()
+		sess.resync = err
+		sess.mu.Unlock()
+	}
 }
 
 // errLocked returns the error the session ended with.
 func (sess *backupSession) errLocked() error {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
+	if sess.resync != nil {
+		return sess.resync
+	}
 	if sess.err == nil {
 		return errSessionEnded
 	}
@@ -324,9 +383,8 @@ func (sess *backupSession) readLoop(ctx context.Context) error {
 			if _, err := decodeHeartbeat(payload); err != nil {
 				return err
 			}
-			if err := sess.conn.writeMessage(Heartbeat{UnixMillis: uint64(time.Now().UnixMilli())}); err != nil {
-				return err
-			}
+			// The heartbeat is not answered. Both sides send their own,
+			// an answer would only bounce between them.
 		case MsgPaused:
 			m, err := decodePaused(payload)
 			if err != nil {
@@ -341,6 +399,7 @@ func (sess *backupSession) readLoop(ctx context.Context) error {
 			return fmt.Errorf("protocol: the source sent an error: %s", m.Message)
 		case MsgResyncRequired:
 			m, _ := decodeResyncRequired(payload)
+			sess.b.setSourceEpoch(m.Epoch)
 			return fmt.Errorf("%w: the source asks for a new snapshot: %s", ErrResyncRequired, m.Reason)
 		default:
 			sess.conn.writeMessage(Error{Code: CodeProtocol, Message: fmt.Sprintf("the message %s is not expected", t)})

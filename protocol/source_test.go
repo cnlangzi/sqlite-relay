@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"io"
+	"math"
 	"net"
 	"slices"
 	"testing"
@@ -501,6 +504,30 @@ func TestSourceStopsOnPause(t *testing.T) {
 	}
 }
 
+func TestSourceReadsEverySegmentOnce(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.BackoffMin = 20 * time.Millisecond
+	src := &fakeSource{}
+	sink := &fakeSink{}
+	addr, _, _ := startSource(t, cfg, src)
+	startBackup(t, cfg, sink, addr)
+
+	// The segments are small, so that every segment is a batch of its
+	// own.
+	var want int64
+	for i := uint64(1); i <= 20; i++ {
+		seg := Segment{SeqStart: i, SeqEnd: i, Bytes: testSegment(t, cfg.DatabaseID, 0, i, 1)}
+		want += int64(len(seg.Bytes))
+		src.add(seg)
+	}
+	if !waitFor(t, 10*time.Second, func() bool { return len(sink.seqs()) == 20 }) {
+		t.Fatalf("the sink applied %v, want twenty transactions", sink.seqs())
+	}
+	if got := src.servedBytes(); got != want {
+		t.Errorf("the source handed out %d bytes, want %d: a segment is read again", got, want)
+	}
+}
+
 func TestSourceStopsWhenTheContextIsDone(t *testing.T) {
 	cfg := testConfig(t)
 	src := &fakeSource{}
@@ -534,10 +561,78 @@ func TestSourceStopsWhenTheContextIsDone(t *testing.T) {
 	}
 }
 
+func TestSourceSendsNoBatchAfterThePaused(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.HeartbeatInterval = 10 * time.Second
+	src := &fakeSource{}
+	seg1 := Segment{SeqStart: 1, SeqEnd: 1, Bytes: testSegment(t, cfg.DatabaseID, 0, 1, 1)}
+	seg2 := Segment{SeqStart: 2, SeqEnd: 2, Bytes: testSegment(t, cfg.DatabaseID, 0, 2, 1)}
+	src.add(seg1, seg2)
+	// The window holds one segment, the source waits with the second one.
+	cfg.MaxUnackedBytes = int64(len(seg1.Bytes))
+	addr, _, _ := startSource(t, cfg, src)
+
+	cl := dialClient(t, addr)
+	cl.write(testHello(t, cfg, testToken))
+	if _, _, err := cl.read(); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if _, _, err := cl.read(); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	cl.write(Pause{AppliedSeq: 1})
+	typ, _, err := cl.read()
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if typ != MsgPaused {
+		t.Fatalf("the message is %s, want PAUSED", typ)
+	}
+
+	// A bigger window does not make the source push while it is paused.
+	cl.write(FlowControl{MaxUnackedBytes: 1 << 20})
+	typ, _, err = cl.readWithin(300 * time.Millisecond)
+	if err == nil {
+		t.Fatalf("the source sent %s after the paused", typ)
+	}
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("the error is %v, want a timeout", err)
+	}
+}
+
+func TestSourceKeepsTheResyncOverTheTransportError(t *testing.T) {
+	// The peer may close the connection while the message that asks for
+	// the snapshot is read, the write of the answer fails first. The
+	// resync is the error that matters.
+	local, remote := net.Pipe()
+	defer remote.Close()
+	sess := &sourceSession{
+		src:  &Source{},
+		conn: newConn(local, 1024, time.Second),
+		wake: make(chan struct{}, 1),
+		done: make(chan struct{}),
+	}
+	sess.finish(io.EOF)
+	sess.finish(fmt.Errorf("%w: the backup asks for a new snapshot", ErrResyncRequired))
+	if !errors.Is(sess.errLocked(), ErrResyncRequired) {
+		t.Errorf("the session ended with %v, want %v", sess.errLocked(), ErrResyncRequired)
+	}
+}
+
+func TestSourceClampsTheWindowOfTheBackup(t *testing.T) {
+	sess := &sourceSession{src: &Source{}}
+	sess.onFlowControl(FlowControl{MaxUnackedBytes: math.MaxUint64})
+	if sess.limit <= 0 {
+		t.Errorf("the window is %d bytes, want a window that is open", sess.limit)
+	}
+}
+
 func TestSourceClosesIdleConnection(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IdleTimeout = 200 * time.Millisecond
-	cfg.HeartbeatInterval = 10 * time.Second
+	cfg.HeartbeatInterval = 50 * time.Millisecond
 	src := &fakeSource{}
 	addr, _, _ := startSource(t, cfg, src)
 
@@ -559,6 +654,30 @@ func TestSourceClosesIdleConnection(t *testing.T) {
 			t.Fatal("the connection stayed open")
 		}
 		return
+	}
+}
+
+func TestSourceDoesNotAnswerHeartbeats(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.HeartbeatInterval = 10 * time.Second
+	src := &fakeSource{}
+	addr, _, _ := startSource(t, cfg, src)
+
+	cl := dialClient(t, addr)
+	cl.write(testHello(t, cfg, testToken))
+	if _, _, err := cl.read(); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	// The peer sends its own heartbeats, an answer would only bounce
+	// between the two sides.
+	cl.write(Heartbeat{UnixMillis: 1})
+	typ, _, err := cl.readWithin(300 * time.Millisecond)
+	if err == nil {
+		t.Fatalf("the source answered the heartbeat with %s", typ)
+	}
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("the error is %v, want a timeout", err)
 	}
 }
 

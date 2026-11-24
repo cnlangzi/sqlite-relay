@@ -120,6 +120,15 @@ func TestBatchRejectsAnEmptySegment(t *testing.T) {
 	}
 }
 
+func TestBatchRejectsALengthThatDoesNotFit(t *testing.T) {
+	// The length of a segment is a u32, it does not fit into an int on
+	// every platform. The decoder has to refuse it and not cut the
+	// payload with it.
+	if _, err := decodeBatch([]byte{0xff, 0xff, 0xff, 0xff}); err == nil {
+		t.Fatal("a batch with a length that does not fit was accepted")
+	}
+}
+
 func TestAckRoundTrip(t *testing.T) {
 	m := Ack{AppliedSeq: 1234, Epoch: 5}
 	got, err := decodeAck(m.encode())
