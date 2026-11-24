@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"time"
 
@@ -110,12 +111,7 @@ func (d *Driver) snapshotOnce(ctx context.Context, dst string) (*Snapshot, error
 			continue
 		}
 		commitPages = tx.CommitPages
-		for _, f := range tx.Frames {
-			if f.Pgno > tx.CommitPages {
-				continue
-			}
-			pages[f.Pgno] = f.Data
-		}
+		maps.Copy(pages, pagesOfTransaction(tx))
 	}
 
 	// Copy the database file and make sure it did not move while it was
@@ -185,7 +181,6 @@ func (d *Driver) pauseCheckpoints() func() {
 func (d *Driver) recordSnapshotError(err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.snapshotErrors++
 	d.lastErr = err
 }
 

@@ -55,6 +55,9 @@ func (g *gate) active() bool {
 
 // wait blocks until the gate opens. It returns the context error if the
 // context is done first.
+//
+// A write is held back until the gate opens. A read is only held back when
+// the caller asked for it.
 func (g *gate) wait(ctx context.Context, write bool) error {
 	for {
 		g.mu.Lock()
@@ -73,21 +76,30 @@ func (g *gate) wait(ctx context.Context, write bool) error {
 	}
 }
 
-// waitWrite blocks a statement that would start a write transaction.
+// waitStatement blocks a statement while the driver is quiesced.
 //
 // A statement that continues a transaction that was opened before the
 // quiesce is not blocked, otherwise the transaction could never finish.
-func (g *gate) waitWrite(query string, conn *managedConn) error {
+func (g *gate) waitStatement(ctx context.Context, query string, conn *managedConn) error {
 	if !g.active() {
 		return nil
 	}
-	if !isWriteStatement(query) {
+	write := isWriteStatement(query)
+	if !write {
+		if !g.readsBlocked() {
+			return nil
+		}
+	} else if conn != nil && conn.inTransaction() {
 		return nil
 	}
-	if conn != nil && conn.inTransaction() {
-		return nil
-	}
-	return g.wait(context.Background(), true)
+	return g.wait(ctx, write)
+}
+
+// readsBlocked reports whether reads are held back as well.
+func (g *gate) readsBlocked() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.blockReads
 }
 
 // writeKeywords are the leading keywords of statements that change the
@@ -107,14 +119,53 @@ var writeKeywords = map[string]bool{
 
 // isWriteStatement reports whether the statement changes the database.
 //
-// The classification looks at the first keyword only. It is a heuristic: a
-// statement that hides a write behind a different keyword is not recognised.
+// The classification looks at the first keyword only. A statement that
+// hides a write behind a common table expression is recognised by the
+// keyword that follows the expression.
 func isWriteStatement(query string) bool {
 	word := firstKeyword(query)
 	if word == "" {
 		return false
 	}
-	return writeKeywords[word]
+	if word != "WITH" {
+		return writeKeywords[word]
+	}
+	// A common table expression is followed by the statement it feeds. Look
+	// for it outside of the parentheses of the expression.
+	return withStatementIsWrite(query)
+}
+
+// withStatementIsWrite reports whether the statement behind a common table
+// expression changes the database.
+func withStatementIsWrite(query string) bool {
+	depth := 0
+	words := strings.FieldsFunc(query, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r == '_')
+	})
+	for _, w := range words {
+		switch w {
+		case "(":
+			depth++
+		case ")":
+			if depth > 0 {
+				depth--
+			}
+		}
+		if depth != 0 {
+			continue
+		}
+		switch strings.ToUpper(w) {
+		case "INSERT", "UPDATE", "DELETE", "REPLACE":
+			return true
+		case "AS", "MATERIALIZED", "NOT", "RECURSIVE", "WITH", "SELECT":
+			// Part of the expression, not the statement behind it.
+		default:
+			if writeKeywords[strings.ToUpper(w)] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // firstKeyword returns the first SQL keyword of a statement.

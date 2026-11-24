@@ -99,13 +99,3 @@ func (h Header) wordOrder() wordOrder {
 func (h Header) FrameSize() int64 {
 	return int64(FrameHeaderSize) + int64(h.PageSize)
 }
-
-// FrameOffset is the byte offset of the given 1-based frame.
-func (h Header) FrameOffset(frame uint64) int64 {
-	return int64(HeaderSize) + int64(frame-1)*h.FrameSize()
-}
-
-// OffsetAfterFrame is the byte offset just past the given 1-based frame.
-func (h Header) OffsetAfterFrame(frame uint64) int64 {
-	return int64(HeaderSize) + int64(frame)*h.FrameSize()
-}

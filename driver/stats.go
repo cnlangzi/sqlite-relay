@@ -23,8 +23,10 @@ type CheckpointStats struct {
 	Busy bool
 	// LogFrames is the number of frames the WAL holds.
 	LogFrames int
-	// Checkpointed is the number of frames the checkpoint wrote back into
-	// the database file.
+	// Checkpointed is the number of frames SQLite has written back into
+	// the database file, counted from the start of the WAL generation. It
+	// is the state of the backfill, not the number of frames the last
+	// checkpoint wrote.
 	Checkpointed int
 	// At is the time the checkpoint ran.
 	At time.Time
@@ -70,4 +72,10 @@ type Stats struct {
 	Checkpoint CheckpointStats
 	// Reclaim describes the last reclaim.
 	Reclaim ReclaimStats
+	// HookPanics is the number of panics that happened inside the WAL
+	// hook. A panic is caught by the driver so that the commit it belongs
+	// to still succeeds.
+	HookPanics int
+	// LastError is the last error the driver ran into.
+	LastError string
 }

@@ -50,13 +50,7 @@ type Batch struct {
 // more than once keeps its last version. Pages beyond the size the database
 // has after the commit are dropped: they belong to a database that shrank.
 func changeFromTransaction(tx wal.Transaction) Change {
-	pages := make(map[uint32][]byte, len(tx.Frames))
-	for _, f := range tx.Frames {
-		if f.Pgno > tx.CommitPages {
-			continue
-		}
-		pages[f.Pgno] = f.Data
-	}
+	pages := pagesOfTransaction(tx)
 	numbers := make([]uint32, 0, len(pages))
 	for pgno := range pages {
 		numbers = append(numbers, pgno)
@@ -68,6 +62,22 @@ func changeFromTransaction(tx wal.Transaction) Change {
 		out = append(out, Page{Pgno: pgno, Data: pages[pgno]})
 	}
 	return Change{CommitPages: tx.CommitPages, Pages: out}
+}
+
+// pagesOfTransaction collects the pages a transaction changed.
+//
+// A page that the transaction wrote more than once keeps its last version.
+// A page beyond the size the database has after the commit is left out: it
+// belongs to a database that shrank.
+func pagesOfTransaction(tx wal.Transaction) map[uint32][]byte {
+	pages := make(map[uint32][]byte, len(tx.Frames))
+	for _, f := range tx.Frames {
+		if f.Pgno > tx.CommitPages {
+			continue
+		}
+		pages[f.Pgno] = f.Data
+	}
+	return pages
 }
 
 // checkFrames verifies that the frame count the driver derived from the WAL

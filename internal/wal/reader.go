@@ -137,21 +137,6 @@ func (r *Reader) Header() Header {
 	return r.hdr
 }
 
-// Frame returns the index of the next frame to be read.
-func (r *Reader) Frame() uint64 {
-	return r.next
-}
-
-// Offset returns the byte offset of the next frame to be read.
-func (r *Reader) Offset() int64 {
-	return r.off
-}
-
-// Seed returns the checksum seed for the next frame to be read.
-func (r *Reader) Seed() Checksum {
-	return r.seed
-}
-
 // Rewind moves the reader back to the first frame.
 func (r *Reader) Rewind() error {
 	r.next = 1
@@ -160,7 +145,16 @@ func (r *Reader) Rewind() error {
 	r.commitFrame = 0
 	r.commitOff = int64(HeaderSize)
 	r.commitSeed = r.seed
-	return nil
+	return r.seek(r.off)
+}
+
+// seek moves the file cursor to the given offset.
+//
+// The logical position of the reader and the cursor of the file have to be
+// moved together, otherwise the reader reads the frames of the wrong place.
+func (r *Reader) seek(offset int64) error {
+	_, err := r.file.Seek(offset, io.SeekStart)
+	return err
 }
 
 // RewindTo moves the reader to the given 1-based frame, rebuilding the
@@ -267,9 +261,12 @@ func (r *Reader) Scan() (*Scan, error) {
 	scan.Offset = r.commitOff
 
 	// Rewind to the last commit frame so that the uncommitted tail is read
-	// again on the next scan.
+	// again on the next scan. The file cursor has to follow.
 	r.next = r.commitFrame + 1
 	r.off = r.commitOff
 	r.seed = r.commitSeed
+	if err := r.seek(r.off); err != nil {
+		return nil, err
+	}
 	return scan, nil
 }

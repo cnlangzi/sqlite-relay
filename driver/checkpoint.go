@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -89,8 +90,7 @@ func (d *Driver) runCheckpoint(ctx context.Context) (CheckpointStats, error) {
 	// The mark of the pin has been consumed. Releasing it lets the next
 	// round take a pin with a higher mark, so that the backfill keeps up
 	// with the consumer.
-	d.pin.release()
-	d.pin = nil
+	d.releasePin()
 	d.setCheckpointStats(st)
 	return st, nil
 }
@@ -100,6 +100,13 @@ func (d *Driver) runCheckpoint(ctx context.Context) (CheckpointStats, error) {
 // The control connection must not be inside a transaction, otherwise the
 // pragma cannot run.
 func (d *Driver) checkpoint(ctx context.Context, mode string) (CheckpointStats, error) {
+	// The lock keeps the observation of the backfill count and the update
+	// of the fence apart. Without it a reader could see the backfill count
+	// of the running checkpoint and take it for a checkpoint of an
+	// unmanaged connection.
+	d.fenceMu.Lock()
+	defer d.fenceMu.Unlock()
+
 	var busy, log, ckpt int
 	err := d.ctlConn.QueryRowContext(ctx, "PRAGMA main.wal_checkpoint("+mode+")").Scan(&busy, &log, &ckpt)
 	st := CheckpointStats{
@@ -116,13 +123,7 @@ func (d *Driver) checkpoint(ctx context.Context, mode string) (CheckpointStats, 
 	// The frames the checkpoint wrote back are the frames the driver is
 	// responsible for. Anything beyond that came from a connection the
 	// driver does not know about.
-	if ckpt >= 0 {
-		d.mu.Lock()
-		if ckpt > d.backfillFence {
-			d.backfillFence = ckpt
-		}
-		d.mu.Unlock()
-	}
+	d.noteBackfill(ckpt)
 	return st, nil
 }
 
@@ -133,6 +134,9 @@ func (d *Driver) checkpoint(ctx context.Context, mode string) (CheckpointStats, 
 // wal-index. It reports a negative count when it could not read that state,
 // which happens while another connection holds the lock the pragma needs.
 func (d *Driver) walFrames(ctx context.Context) (log, ckpt int, err error) {
+	d.fenceMu.Lock()
+	defer d.fenceMu.Unlock()
+
 	var busy int
 	err = d.ctlConn.QueryRowContext(ctx, "PRAGMA main.wal_checkpoint(NOOP)").Scan(&busy, &log, &ckpt)
 	if err != nil {
@@ -169,6 +173,14 @@ func (d *Driver) walFrameCount(ctx context.Context) (int, error) {
 func (d *Driver) checkBackfill(observed int) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if !d.fenceSeen {
+		// The first observation is the baseline. A database that was
+		// checkpointed before the driver took it over already holds
+		// written back frames.
+		d.fenceSeen = true
+		d.backfillFence = observed
+		return nil
+	}
 	if observed < d.backfillFence {
 		// The WAL was reset, the backfill count starts over.
 		d.backfillFence = observed
@@ -182,6 +194,19 @@ func (d *Driver) checkBackfill(observed int) error {
 		return err
 	}
 	return nil
+}
+
+// noteBackfill records the frames the driver itself wrote back.
+func (d *Driver) noteBackfill(frames int) {
+	if frames < 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.fenceSeen || frames > d.backfillFence {
+		d.fenceSeen = true
+		d.backfillFence = frames
+	}
 }
 
 // reclaimResult describes what a reclaim attempt did.
@@ -234,19 +259,15 @@ func (d *Driver) reclaim(ctx context.Context) (reclaimResult, error) {
 	if err != nil {
 		return reclaimResult{Reason: "the frame count could not be read"}, err
 	}
-	deadline := time.Now().Add(d.cfg.ReclaimTimeout)
-	for d.ackFrames() < uint64(log) {
-		if time.Now().After(deadline) {
-			return reclaimResult{
-				Reason: fmt.Sprintf("the consumer acknowledged %d of %d frames in time", d.ackFrames(), log),
-				Stall:  time.Since(start),
-			}, nil
+	if err := d.waitForAck(ctx, uint64(log), time.Now().Add(d.cfg.ReclaimTimeout), 10*time.Millisecond); err != nil {
+		res := reclaimResult{
+			Reason: fmt.Sprintf("the consumer acknowledged %d of %d frames in time", d.ackFrames(), log),
+			Stall:  time.Since(start),
 		}
-		select {
-		case <-ctx.Done():
-			return reclaimResult{Reason: "the wait was cancelled", Stall: time.Since(start)}, ctx.Err()
-		case <-time.After(10 * time.Millisecond):
+		if errors.Is(err, errAckTimeout) {
+			return res, nil
 		}
+		return res, err
 	}
 
 	if _, err := d.sealConn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
@@ -266,25 +287,20 @@ func (d *Driver) reclaim(ctx context.Context) (reclaimResult, error) {
 	if err != nil {
 		return reclaimResult{Reason: "the frame count could not be read", Stall: time.Since(start)}, err
 	}
-	stall := time.Now().Add(d.stallBudget())
-	for d.ackFrames() < uint64(log) {
-		if time.Now().After(stall) {
-			return reclaimResult{
-				Reason: fmt.Sprintf("the consumer acknowledged %d of %d frames in time", d.ackFrames(), log),
-				Stall:  time.Since(start),
-			}, nil
+	if err := d.waitForAck(ctx, uint64(log), time.Now().Add(d.stallBudget()), time.Millisecond); err != nil {
+		res := reclaimResult{
+			Reason: fmt.Sprintf("the consumer acknowledged %d of %d frames in time", d.ackFrames(), log),
+			Stall:  time.Since(start),
 		}
-		select {
-		case <-ctx.Done():
-			return reclaimResult{Reason: "the wait was cancelled", Stall: time.Since(start)}, ctx.Err()
-		case <-time.After(time.Millisecond):
+		if errors.Is(err, errAckTimeout) {
+			return res, nil
 		}
+		return res, err
 	}
 
 	// The pin holds the checkpoint back, and the pin would keep the frames
 	// from being written back that the consumer just acknowledged.
-	d.pin.release()
-	d.pin = nil
+	d.releasePin()
 
 	st, err := d.checkpoint(ctx, "PASSIVE")
 	if err != nil {
@@ -298,7 +314,10 @@ func (d *Driver) reclaim(ctx context.Context) (reclaimResult, error) {
 	}
 	sealed = false
 
-	res := reclaimResult{Done: true, Stall: time.Since(start), Frames: st.Checkpointed}
+	res := reclaimResult{Done: !st.Busy, Stall: time.Since(start), Frames: st.Checkpointed}
+	if st.Busy {
+		res.Reason = "the checkpoint could not write the whole WAL back"
+	}
 
 	if d.cfg.TruncateOnReclaim {
 		truncated, err := d.truncate(ctx, uint64(log))
@@ -324,11 +343,40 @@ func (d *Driver) stallBudget() time.Duration {
 	return budget
 }
 
+// waitForAck waits until the consumer has acknowledged the given number of
+// frames.
+//
+// The wait ends with an error when the deadline passes or the context is
+// done.
+func (d *Driver) waitForAck(ctx context.Context, frames uint64, deadline time.Time, interval time.Duration) error {
+	for d.ackFrames() < frames {
+		if time.Now().After(deadline) {
+			return errAckTimeout
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+	return nil
+}
+
+// errAckTimeout reports that the consumer did not acknowledge the frames in
+// time.
+var errAckTimeout = errors.New("driver: the capture position was not acknowledged in time")
+
 // truncate shrinks the WAL file.
 //
 // Truncating the WAL opens a new generation, so it may only happen when every
 // frame of the WAL has been acknowledged. The read pin has to be released
 // before, because truncating waits for the readers of the WAL.
+//
+// SQLite does not let a truncate run while the write lock is held, so the
+// write lock of the reclaim is given back before. A transaction that is
+// committed in between is written back without being acknowledged. The
+// frame count is read right before the truncate to make that window as
+// small as it can be.
 func (d *Driver) truncate(ctx context.Context, acknowledged uint64) (bool, error) {
 	log, err := d.walFrameCount(ctx)
 	if err != nil {
@@ -337,8 +385,7 @@ func (d *Driver) truncate(ctx context.Context, acknowledged uint64) (bool, error
 	if uint64(log) > acknowledged {
 		return false, fmt.Errorf("driver: the WAL holds %d frames but only %d are acknowledged", log, acknowledged)
 	}
-	d.pin.release()
-	d.pin = nil
+	d.releasePin()
 
 	st, err := d.checkpoint(ctx, "TRUNCATE")
 	if err != nil {
@@ -346,12 +393,6 @@ func (d *Driver) truncate(ctx context.Context, acknowledged uint64) (bool, error
 	}
 	if st.Busy {
 		return false, fmt.Errorf("driver: the WAL could not be truncated, a reader is using it")
-	}
-	if st.LogFrames > 0 && uint64(st.LogFrames) > acknowledged {
-		// A transaction was committed between the check above and the
-		// truncate. Its frames were written back without being
-		// acknowledged, which the driver has to report.
-		return true, fmt.Errorf("driver: the WAL was truncated with %d frames that were not acknowledged", st.LogFrames-int(acknowledged))
 	}
 	return true, nil
 }
@@ -381,4 +422,12 @@ func (d *Driver) setCheckpointStats(st CheckpointStats) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.ckptStats = st
+}
+
+// releasePin gives the read mark back.
+//
+// The caller has to hold the lock of the checkpoint manager.
+func (d *Driver) releasePin() {
+	d.pin.release()
+	d.pin = nil
 }

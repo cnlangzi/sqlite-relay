@@ -233,7 +233,7 @@ func TestHookPanicDoesNotFailTheCommit(t *testing.T) {
 	createTable(t, d)
 
 	// A closed channel makes the notification panic inside the hook.
-	close(d.events)
+	d.closeEvents()
 
 	if _, err := d.DB().Exec("INSERT INTO t(v) VALUES('boom')"); err != nil {
 		t.Fatalf("the commit failed because of the hook: %v", err)

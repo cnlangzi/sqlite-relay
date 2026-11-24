@@ -69,11 +69,15 @@ type managedConn struct {
 // Prepare implements driver.Conn.
 func (m *managedConn) Prepare(query string) (driver.Stmt, error) {
 	if m.gated {
-		if err := m.d.gate.waitWrite(query, m); err != nil {
+		if err := m.d.gate.waitStatement(context.Background(), query, m); err != nil {
 			return nil, err
 		}
 	}
-	return m.conn.Prepare(query)
+	stmt, err := m.conn.Prepare(query)
+	if err != nil {
+		return nil, err
+	}
+	return &managedStmt{stmt: stmt, query: query, d: m.d, conn: m}, nil
 }
 
 // Close implements driver.Conn.
@@ -84,8 +88,16 @@ func (m *managedConn) Close() error {
 
 // Begin implements driver.Conn.
 func (m *managedConn) Begin() (driver.Tx, error) {
+	return m.BeginTx(context.Background(), driver.TxOptions{})
+}
+
+// BeginTx implements driver.ConnBeginTx.
+//
+// The context of the caller is passed on, so that a writer that waits for
+// the resume can be cancelled.
+func (m *managedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	if m.gated {
-		if err := m.d.gate.wait(m.d.ctx, true); err != nil {
+		if err := m.d.gate.wait(ctx, true); err != nil {
 			return nil, err
 		}
 	}
@@ -96,6 +108,70 @@ func (m *managedConn) Begin() (driver.Tx, error) {
 	m.setInTx(true)
 	m.d.txOpened()
 	return &managedTx{tx: tx, m: m}, nil
+}
+
+// managedStmt applies the quiesce gate when a statement runs.
+//
+// The gate has to be applied when the statement runs and not when it is
+// prepared: the statement pool of database/sql keeps prepared statements
+// around and reuses them without preparing them again.
+type managedStmt struct {
+	stmt  driver.Stmt
+	query string
+	d     *Driver
+	conn  *managedConn
+}
+
+// Close implements driver.Stmt.
+func (s *managedStmt) Close() error {
+	return s.stmt.Close()
+}
+
+// NumInput implements driver.Stmt.
+func (s *managedStmt) NumInput() int {
+	return s.stmt.NumInput()
+}
+
+// Exec implements driver.Stmt.
+func (s *managedStmt) Exec(args []driver.Value) (driver.Result, error) {
+	if err := s.d.gate.waitStatement(context.Background(), s.query, s.conn); err != nil {
+		return nil, err
+	}
+	return s.stmt.Exec(args)
+}
+
+// Query implements driver.Stmt.
+func (s *managedStmt) Query(args []driver.Value) (driver.Rows, error) {
+	if err := s.d.gate.waitStatement(context.Background(), s.query, s.conn); err != nil {
+		return nil, err
+	}
+	return s.stmt.Query(args)
+}
+
+// ExecContext implements driver.StmtExecContext.
+func (s *managedStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	if err := s.d.gate.waitStatement(ctx, s.query, s.conn); err != nil {
+		return nil, err
+	}
+	return s.stmt.Exec(namedToValue(args))
+}
+
+// QueryContext implements driver.StmtQueryContext.
+func (s *managedStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	if err := s.d.gate.waitStatement(ctx, s.query, s.conn); err != nil {
+		return nil, err
+	}
+	return s.stmt.Query(namedToValue(args))
+}
+
+// namedToValue turns the arguments of a statement into the values the
+// driver of SQLite understands.
+func namedToValue(args []driver.NamedValue) []driver.Value {
+	out := make([]driver.Value, len(args))
+	for i, a := range args {
+		out[i] = a.Value
+	}
+	return out
 }
 
 func (m *managedConn) setInTx(inTx bool) {
@@ -225,11 +301,34 @@ func (d *Driver) checkConnInvariants(conn *sqlite3.SQLiteConn) error {
 	if err != nil {
 		return fmt.Errorf("driver: read wal_autocheckpoint: %w", err)
 	}
-	if n != 0 {
-		if err := d.disableAutocheckpoint(conn); err != nil {
+	if n == 0 {
+		return nil
+	}
+	// Switching the automatic checkpoint off removes the hook of the
+	// driver as well, so the hook has to be put back.
+	if err := d.disableAutocheckpoint(conn); err != nil {
+		return err
+	}
+	conn.RegisterWalHook(d.walHook)
+	return fmt.Errorf("driver: wal_autocheckpoint was set to %d on a managed connection, the WAL hook was replaced", n)
+}
+
+// checkInvariants verifies the connection level invariants of every managed
+// connection.
+//
+// The control connections belong to the driver alone, so the business
+// connections are the ones that can lose their hook.
+func (d *Driver) checkInvariants() error {
+	d.mu.Lock()
+	conns := make([]*managedConn, 0, len(d.conns))
+	for c := range d.conns {
+		conns = append(conns, c)
+	}
+	d.mu.Unlock()
+	for _, c := range conns {
+		if err := d.checkConnInvariants(c.conn); err != nil {
 			return err
 		}
-		return fmt.Errorf("driver: wal_autocheckpoint was set to %d on a managed connection, the WAL hook was replaced", n)
 	}
 	return nil
 }

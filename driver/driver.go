@@ -115,22 +115,33 @@ type Driver struct {
 	gate   *gate
 
 	// mu guards the state below.
-	mu             sync.Mutex
-	conns          map[*managedConn]struct{}
-	cursor         Position
-	genBoundary    uint64
-	ack            Position
-	backfillFence  int
-	ckptStats      CheckpointStats
-	reclaimStats   ReclaimStats
-	fatalErr       error
-	lastErr        error
-	hookPanics     int
-	snapshotErrors int
-	openTx         int
-	seq            uint64
-	walHighWater   int64
-	lastReclaim    time.Time
+	mu            sync.Mutex
+	conns         map[*managedConn]struct{}
+	cursor        Position
+	cursorSet     bool
+	walBoundary   uint64
+	ack           Position
+	ackSet        bool
+	backfillFence int
+	fenceSeen     bool
+	ckptStats     CheckpointStats
+	reclaimStats  ReclaimStats
+	fatalErr      error
+	lastErr       error
+	closed        bool
+	hookPanics    int
+	openTx        int
+	seq           uint64
+	walHighWater  int64
+	lastReclaim   time.Time
+
+	// fenceMu serialises the observation of the backfill count with the
+	// checkpoints of the driver.
+	fenceMu sync.Mutex
+
+	// eventsMu guards the channel of the notifications.
+	eventsMu     sync.Mutex
+	eventsClosed bool
 
 	// captureMu serializes the capture rounds.
 	captureMu sync.Mutex
@@ -159,7 +170,7 @@ func Open(ctx context.Context, cfg Config) (*Driver, error) {
 		gate:   newGate(),
 		conns:  make(map[*managedConn]struct{}),
 	}
-	d.ctx, d.cancel = context.WithCancel(context.Background())
+	d.ctx, d.cancel = context.WithCancel(ctx)
 	// The first reclaim happens one interval after the driver started, not
 	// right away: a reclaim stops the business writers while it waits for the
 	// capture position to be acknowledged.
@@ -291,11 +302,17 @@ func (d *Driver) CaptureAck(_ context.Context, pos Position) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.ack.sameGeneration(pos) && pos.Frame <= d.ack.Frame {
+	if d.ackSet && !d.cursor.sameGeneration(pos) {
+		// The acknowledgement belongs to another generation and says
+		// nothing about the frames of the current one.
+		return nil
+	}
+	if d.ackSet && pos.Frame <= d.ack.Frame {
 		// An acknowledgement never goes back.
 		return nil
 	}
 	d.ack = pos
+	d.ackSet = true
 	return nil
 }
 
@@ -335,6 +352,10 @@ func (d *Driver) Stats() Stats {
 		WALHighWater:   d.walHighWater,
 		Checkpoint:     d.ckptStats,
 		Reclaim:        d.reclaimStats,
+		HookPanics:     d.hookPanics,
+	}
+	if d.lastErr != nil {
+		st.LastError = d.lastErr.Error()
 	}
 	if info, err := os.Stat(d.walPath); err == nil {
 		st.WALBytes = info.Size()
@@ -383,18 +404,34 @@ func (d *Driver) Resume() error {
 }
 
 // Close stops the driver and releases its connections.
+//
+// The channel of Events is closed, a consumer that ranges over it ends.
 func (d *Driver) Close() error {
 	d.closeOnce.Do(func() {
 		d.cancel()
 		d.wg.Wait()
 		d.gate.resumeGate()
 		d.ckptMu.Lock()
-		d.pin.release()
-		d.pin = nil
+		d.releasePin()
 		d.ckptMu.Unlock()
 		d.closePools()
+		d.closeEvents()
 	})
 	return nil
+}
+
+// closeEvents closes the channel of the notifications.
+//
+// The channel may have been closed by the caller of the driver, which the
+// driver cannot tell apart from its own close.
+func (d *Driver) closeEvents() {
+	d.eventsMu.Lock()
+	defer d.eventsMu.Unlock()
+	if d.eventsClosed {
+		return
+	}
+	d.eventsClosed = true
+	close(d.events)
 }
 
 // closePools releases the connection pools.
@@ -477,7 +514,8 @@ func (d *Driver) recover() error {
 	reader, err := d.walReader()
 	if err != nil {
 		if errors.Is(err, wal.ErrNoWAL) {
-			// There is no WAL yet, the cursor stays at the start.
+			// There is no WAL yet. The cursor takes the generation of
+			// the WAL that shows up later.
 			return nil
 		}
 		return err
@@ -494,7 +532,7 @@ func (d *Driver) recover() error {
 		}
 		d.mu.Lock()
 		d.cursor = pos
-		d.genBoundary = pos.Frame
+		d.cursorSet = true
 		d.mu.Unlock()
 		return nil
 	}
@@ -505,6 +543,7 @@ func (d *Driver) recover() error {
 	// seen already by their position.
 	d.mu.Lock()
 	d.cursor = Position{Salt1: hdr.Salt1, Salt2: hdr.Salt2, WALOffset: walOffset(0, d.pageSize)}
+	d.cursorSet = true
 	d.mu.Unlock()
 	return nil
 }
@@ -580,6 +619,7 @@ func (d *Driver) captureOnce(ctx context.Context) (Batch, bool, error) {
 	if err != nil {
 		return Batch{}, false, err
 	}
+	d.noteWALBoundary(after)
 	// The pragma reports a negative count when it could not read the state
 	// of the WAL. The generation check below covers that case.
 	if before >= 0 && after >= 0 {
@@ -614,9 +654,16 @@ func (d *Driver) captureOnce(ctx context.Context) (Batch, bool, error) {
 }
 
 // batchOf turns the transactions of a scan into a batch.
+//
+// The transactions that were captured already are left out. A scan that
+// starts at the beginning of the WAL, which happens when the reader was
+// reset, would hand them out a second time.
 func (d *Driver) batchOf(scan *wal.Scan, from Position) Batch {
 	batch := Batch{From: from}
 	for _, tx := range scan.Transactions {
+		if tx.CommitFrame <= from.Frame {
+			continue
+		}
 		change := changeFromTransaction(tx)
 		change.Seq = d.nextSeq()
 		change.Pos = Position{
@@ -645,12 +692,37 @@ func (d *Driver) handleGenerationChange(hdr wal.Header) error {
 	if d.cursor.sameGeneration(next) {
 		return nil
 	}
-	if d.cursor.Frame < d.genBoundary {
-		return fmt.Errorf("driver: the WAL was reset with %d of %d frames uncaptured, a new snapshot is needed", d.genBoundary-d.cursor.Frame, d.genBoundary)
+	if !d.cursorSet {
+		// The driver started before the WAL existed. The first
+		// generation it sees is the one it captures from.
+		d.cursor = Position{Salt1: hdr.Salt1, Salt2: hdr.Salt2, WALOffset: walOffset(0, d.pageSize)}
+		d.cursorSet = true
+		d.walBoundary = 0
+		return nil
+	}
+	if d.cursor.Frame < d.walBoundary {
+		return fmt.Errorf("driver: the WAL was reset with %d of %d frames uncaptured, a new snapshot is needed", d.walBoundary-d.cursor.Frame, d.walBoundary)
 	}
 	d.cursor = Position{Salt1: hdr.Salt1, Salt2: hdr.Salt2, Frame: 0, WALOffset: walOffset(0, d.pageSize)}
-	d.genBoundary = 0
+	d.cursorSet = true
+	d.walBoundary = 0
 	return nil
+}
+
+// noteWALBoundary records the number of frames the WAL holds.
+//
+// The boundary of a generation is the last frame that was committed in it.
+// The driver needs it to find out whether a reset of the WAL lost frames
+// that it had not captured yet.
+func (d *Driver) noteWALBoundary(frames int) {
+	if frames < 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if uint64(frames) > d.walBoundary {
+		d.walBoundary = uint64(frames)
+	}
 }
 
 // cursorPosition returns the position the cursor is at.
@@ -665,9 +737,7 @@ func (d *Driver) advanceCursorTo(pos Position) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.cursor = pos
-	if pos.Frame > d.genBoundary {
-		d.genBoundary = pos.Frame
-	}
+	d.cursorSet = true
 }
 
 // nextSeq returns the next number of the change counter.
@@ -723,6 +793,7 @@ func (d *Driver) tick() {
 		d.recordError(err)
 	}
 	if log, _, err := d.walFrames(ctx); err == nil && log >= 0 {
+		d.noteWALBoundary(log)
 		if uint64(log) > d.cursorPosition().Frame {
 			d.notify(Notification{DBName: "main", Frames: log})
 		}
@@ -731,21 +802,6 @@ func (d *Driver) tick() {
 		d.recordError(err)
 	}
 	d.maybeReclaim(ctx)
-}
-
-// checkInvariants verifies the connection level invariants of the control
-// connection.
-//
-// The control connections belong to the driver alone, so they can be read
-// without interfering with a business statement.
-func (d *Driver) checkInvariants() error {
-	return d.ctlConn.Raw(func(dc any) error {
-		mc, ok := dc.(*managedConn)
-		if !ok {
-			return fmt.Errorf("driver: unexpected connection type %T", dc)
-		}
-		return d.checkConnInvariants(mc.conn)
-	})
 }
 
 // maybeReclaim gives the WAL space back when it grew too much.

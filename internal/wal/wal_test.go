@@ -207,6 +207,43 @@ func TestScanHeaderOnly(t *testing.T) {
 	}
 }
 
+func TestRewindReadsTheWALAgain(t *testing.T) {
+	dir := t.TempDir()
+	b := newBuilder()
+	b.frame(1, 0, 'a')
+	b.frame(2, 2, 'b')
+	b.frame(3, 0, 'c')
+	b.frame(4, 4, 'd')
+	path := b.write(t, dir)
+
+	r := openReader(t, path)
+	first, err := r.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(first.Transactions) != 2 {
+		t.Fatalf("got %d transactions, want 2", len(first.Transactions))
+	}
+
+	// The reader has to move the file cursor with its logical position,
+	// otherwise the second scan reads the wrong place.
+	if err := r.RewindTo(1); err != nil {
+		t.Fatalf("RewindTo: %v", err)
+	}
+	second, err := r.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(second.Transactions) != len(first.Transactions) {
+		t.Fatalf("the second scan found %d transactions, want %d", len(second.Transactions), len(first.Transactions))
+	}
+	for i, tx := range second.Transactions {
+		if tx.CommitFrame != first.Transactions[i].CommitFrame {
+			t.Errorf("the transaction %d ends at frame %d, want %d", i, tx.CommitFrame, first.Transactions[i].CommitFrame)
+		}
+	}
+}
+
 func TestOpenMissingWAL(t *testing.T) {
 	_, err := Open(filepath.Join(t.TempDir(), "absent-wal"))
 	if !errors.Is(err, ErrNoWAL) {

@@ -118,6 +118,13 @@ so a business write waits instead of failing.
 
 `Stats` reports the stall and the outcome of the last reclaim.
 
+`TruncateOnReclaim` lets the reclaim shrink the WAL file. SQLite does not
+let a truncate run while the write lock is held, so a transaction that is
+committed between the write lock being given back and the truncate is
+written back without being acknowledged. The driver reads the frame count of
+the WAL right before the truncate and gives up when the WAL holds more than
+the acknowledged frames. The feature is off by default.
+
 ### Snapshots
 
 ```go
@@ -140,6 +147,10 @@ position bring the database up to date without a gap and without a repeat.
 The consumer persists the position of the snapshot and hands it to the driver
 as the `ResumePosition` after a restart.
 
+A snapshot moves the capture cursor of the driver to the position of the
+snapshot. The transactions between the cursor and the snapshot are part of
+the snapshot and are not handed out again.
+
 The driver retries a snapshot when the database file moved while it was
 copied or when the result is not a valid database. A snapshot that does not
 come out after `SnapshotRetries` attempts is an error.
@@ -157,6 +168,11 @@ defer d.Resume()
 resume instead of failing with `SQLITE_BUSY`, so the window in which no new
 write starts stays free of errors. `Quiesce` returns once the write
 transactions that were open have finished.
+
+The gate is applied when a statement runs and not when it is prepared, so a
+statement that was prepared before the quiesce is held back as well. A
+writer that waits for the resume follows the context of its caller and can
+be cancelled.
 
 `QuiesceWith` takes a `QuiesceOptions` and can block new read transactions
 as well.
@@ -249,29 +265,29 @@ they are an upper bound.
 
 | Benchmark | ns/op | |
 |---|---|---|
-| `BenchmarkWalHook` | 16.5 | the WAL hook of a commit |
-| `BenchmarkCommit` | 29723 | 33644 tx/s, 4140 WAL bytes per transaction |
-| `BenchmarkCaptureThroughput` | 105243 | 9502 tx/s |
-| `BenchmarkScanEmpty` | 53761 | a capture round that finds nothing |
-| `BenchmarkCaptureLatency` | 104779 | 104588 ns from the commit to the capture |
-| `BenchmarkCheckpoint` | 315902 | |
-| `BenchmarkSnapshot` | 2008909 | |
+| `BenchmarkWalHook` | 13.4 | the WAL hook of a commit |
+| `BenchmarkCommit` | 28821 | 34697 tx/s, 4140 WAL bytes per transaction |
+| `BenchmarkCaptureThroughput` | 116594 | 8577 tx/s |
+| `BenchmarkScanEmpty` | 49431 | a capture round that finds nothing |
+| `BenchmarkCaptureLatency` | 135498 | 135251 ns from the commit to the capture |
+| `BenchmarkCheckpoint` | 135775 | |
+| `BenchmarkSnapshot` | 3412584 | |
 
-The WAL hook costs 16 nanoseconds and does not block the business write. It
+The WAL hook costs 13 nanoseconds and does not block the business write. It
 only hands a notification to the consumer and returns. The hook does not
 parse the WAL, it does not touch the disk and it does not wait for
 anything.
 
 A transaction that writes one page makes the WAL grow by 4140 bytes, one
 frame header and one page. The WAL of a database that writes this many
-transactions grows by 139 MB per second at the rate of the commit benchmark
-and by 39 MB per second at the rate of the capture benchmark.
+transactions grows by 143 MB per second at the rate of the commit benchmark
+and by 35 MB per second at the rate of the capture benchmark.
 
-A capture round that finds nothing costs 54 microseconds. That is the price
+A capture round that finds nothing costs 49 microseconds. That is the price
 the periodic scan pays for the promise that the driver finds a commit even
 when no notification arrives.
 
-A checkpoint writes the whole WAL back into the database file and costs 316
+A checkpoint writes the whole WAL back into the database file and costs 136
 microseconds for a single frame.
 
 ### The delay of an increment
@@ -280,12 +296,12 @@ The delay between a commit and the backup that holds it has three parts:
 
 | Part | Where it comes from | Measured |
 |---|---|---|
-| Capture delay | the notification of the WAL hook until `Scan` hands the transaction out | 66 us |
+| Capture delay | the notification of the WAL hook until `Scan` hands the transaction out | 84 us |
 | Merge delay | the time the consumer waits to merge transactions into a segment | the linger of the spool |
 | Write delay | the time the spool needs to put the segment on the disk | the fsync of the spool |
 
-The capture delay is the part the driver is responsible for. It is 66
-microseconds at the rate of the benchmark, of which the commit itself is 30
+The capture delay is the part the driver is responsible for. It is 84
+microseconds at the rate of the benchmark, of which the commit itself is 29
 microseconds.
 
 The merge delay and the write delay belong to the spool. The capture delay
@@ -295,7 +311,7 @@ captured yet when the segment is closed.
 
 The capture throughput of 9502 transactions per second and the WAL growth of
 4140 bytes per transaction give the size of the WAL between two
-checkpoints: the WAL grows by 39 MB per second, so the default threshold of
+checkpoints: the WAL grows by 35 MB per second, so the default threshold of
 64 MiB is reached after about two seconds.
 
 The thresholds of the driver follow from these numbers:
@@ -303,6 +319,6 @@ The thresholds of the driver follow from these numbers:
 | Setting | Default | Why |
 |---|---|---|
 | `ScanInterval` | 1s | the capture delay of 66 us is far below the interval, the scan is not the bottleneck |
-| `ReclaimBytes` | 64 MiB | at 39 MB per second the WAL is written back after about two seconds |
+| `ReclaimBytes` | 64 MiB | at 35 MB per second the WAL is written back after about two seconds |
 | `ReclaimInterval` | 5m | the lower bound for the space that is given back |
 | `ReclaimTimeout` | 5s | the time the consumer has to acknowledge the frames that are held back |
