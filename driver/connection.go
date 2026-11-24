@@ -64,6 +64,12 @@ type managedConn struct {
 
 	mu   sync.Mutex
 	inTx bool
+
+	// useMu guards the raw use of conn against the close of the
+	// connection. The invariants of the connection are checked outside of
+	// database/sql, which owns the lifecycle of the connection and closes
+	// it when it discards it.
+	useMu sync.RWMutex
 }
 
 // Prepare implements driver.Conn.
@@ -82,6 +88,8 @@ func (m *managedConn) Prepare(query string) (driver.Stmt, error) {
 
 // Close implements driver.Conn.
 func (m *managedConn) Close() error {
+	m.useMu.Lock()
+	defer m.useMu.Unlock()
 	m.d.unregister(m)
 	return m.conn.Close()
 }
@@ -326,7 +334,10 @@ func (d *Driver) checkInvariants() error {
 	}
 	d.mu.Unlock()
 	for _, c := range conns {
-		if err := d.checkConnInvariants(c.conn); err != nil {
+		c.useMu.RLock()
+		err := d.checkConnInvariants(c.conn)
+		c.useMu.RUnlock()
+		if err != nil {
 			return err
 		}
 	}
