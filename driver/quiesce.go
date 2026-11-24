@@ -140,7 +140,7 @@ func isWriteStatement(query string) bool {
 func withStatementIsWrite(query string) bool {
 	depth := 0
 	words := strings.FieldsFunc(query, func(r rune) bool {
-		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r == '_')
+		return !isLetter(r) && r != '_'
 	})
 	for _, w := range words {
 		switch w {
@@ -190,12 +190,12 @@ func firstKeyword(query string) string {
 		break
 	}
 	end := 0
-	for end < len(s) && (isLetter(s[end]) || s[end] == '_') {
+	for end < len(s) && (isLetter(rune(s[end])) || s[end] == '_') {
 		end++
 	}
 	return strings.ToUpper(s[:end])
 }
 
-func isLetter(c byte) bool {
+func isLetter(c rune) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }

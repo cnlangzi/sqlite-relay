@@ -128,7 +128,6 @@ type Driver struct {
 	reclaimStats  ReclaimStats
 	fatalErr      error
 	lastErr       error
-	closed        bool
 	hookPanics    int
 	openTx        int
 	seq           uint64
@@ -275,7 +274,7 @@ func (d *Driver) ReadChanges(ctx context.Context, pos Position) (Batch, error) {
 		}
 		return Batch{}, fmt.Errorf("driver: open WAL: %w", err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	hdr := reader.Header()
 	if !pos.sameGeneration(Position{Salt1: hdr.Salt1, Salt2: hdr.Salt2}) {
@@ -438,12 +437,12 @@ func (d *Driver) closeEvents() {
 func (d *Driver) closePools() {
 	for _, c := range []*sql.Conn{d.ctlConn, d.pinConn, d.sealConn} {
 		if c != nil {
-			c.Close()
+			_ = c.Close()
 		}
 	}
 	for _, p := range []*sql.DB{d.db, d.ctlDB, d.pinDB, d.sealDB} {
 		if p != nil {
-			p.Close()
+			_ = p.Close()
 		}
 	}
 }
@@ -565,7 +564,7 @@ func (d *Driver) walReader() (*wal.Reader, error) {
 // again.
 func (d *Driver) resetReader() {
 	if d.reader != nil {
-		d.reader.Close()
+		_ = d.reader.Close()
 		d.reader = nil
 	}
 }

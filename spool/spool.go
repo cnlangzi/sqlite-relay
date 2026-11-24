@@ -412,7 +412,7 @@ func (s *Spool) Close() error {
 		return nil
 	}
 	err := s.open.file.Close()
-	os.Remove(s.open.path)
+	_ = os.Remove(s.open.path)
 	s.open = nil
 	return err
 }
@@ -541,8 +541,8 @@ func (s *Spool) openSegment() error {
 	}
 	writer, err := segment.NewWriter(file, h)
 	if err != nil {
-		file.Close()
-		os.Remove(path)
+		_ = file.Close()
+		_ = os.Remove(path)
 		return fmt.Errorf("spool: write the header of the segment: %w", err)
 	}
 	s.open = &openSegment{
@@ -564,8 +564,8 @@ func (s *Spool) discardOpen() {
 	if s.open == nil {
 		return
 	}
-	s.open.file.Close()
-	os.Remove(s.open.path)
+	_ = s.open.file.Close()
+	_ = os.Remove(s.open.path)
 	s.open = nil
 }
 
@@ -619,7 +619,7 @@ func (s *Spool) closeOpen() error {
 
 	if err := o.file.Close(); err != nil {
 		s.open = nil
-		os.Remove(o.path)
+		_ = os.Remove(o.path)
 		return fmt.Errorf("spool: close the segment: %w", err)
 	}
 	s.open = nil
@@ -673,7 +673,7 @@ func (s *Spool) publishSegment(p *pendingSegment) error {
 			return fmt.Errorf("spool: open %s: %w", p.path, err)
 		}
 		err = s.syncFile(p.path, file)
-		file.Close()
+		_ = file.Close()
 		if err != nil {
 			return fmt.Errorf("spool: sync the segment: %w", err)
 		}
@@ -1040,6 +1040,6 @@ func defaultSyncDir(path string) error {
 	if err != nil {
 		return err
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 	return d.Sync()
 }

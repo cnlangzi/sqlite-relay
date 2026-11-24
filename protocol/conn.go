@@ -31,7 +31,7 @@ func (c *conn) writeFrame(t MessageType, payload []byte) error {
 	if err := c.SetWriteDeadline(time.Now().Add(c.timeout)); err != nil {
 		return err
 	}
-	_, err := c.Conn.Write(EncodeFrame(t, payload))
+	_, err := c.Write(EncodeFrame(t, payload))
 	return err
 }
 

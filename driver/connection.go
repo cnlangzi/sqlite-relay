@@ -40,7 +40,7 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	}
 	sc, ok := conn.(*sqlite3.SQLiteConn)
 	if !ok {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("driver: unexpected connection type %T", conn)
 	}
 	mc := &managedConn{conn: sc, d: c.d, gated: c.gated}
@@ -64,6 +64,12 @@ type managedConn struct {
 
 	mu   sync.Mutex
 	inTx bool
+
+	// useMu guards the raw use of conn against the close of the
+	// connection. The invariants of the connection are checked outside of
+	// database/sql, which owns the lifecycle of the connection and closes
+	// it when it discards it.
+	useMu sync.RWMutex
 }
 
 // Prepare implements driver.Conn.
@@ -82,6 +88,8 @@ func (m *managedConn) Prepare(query string) (driver.Stmt, error) {
 
 // Close implements driver.Conn.
 func (m *managedConn) Close() error {
+	m.useMu.Lock()
+	defer m.useMu.Unlock()
 	m.d.unregister(m)
 	return m.conn.Close()
 }
@@ -137,7 +145,7 @@ func (s *managedStmt) Exec(args []driver.Value) (driver.Result, error) {
 	if err := s.d.gate.waitStatement(context.Background(), s.query, s.conn); err != nil {
 		return nil, err
 	}
-	return s.stmt.Exec(args)
+	return s.stmt.Exec(args) //nolint:staticcheck // a driver has to implement the deprecated methods of driver.Stmt
 }
 
 // Query implements driver.Stmt.
@@ -145,7 +153,7 @@ func (s *managedStmt) Query(args []driver.Value) (driver.Rows, error) {
 	if err := s.d.gate.waitStatement(context.Background(), s.query, s.conn); err != nil {
 		return nil, err
 	}
-	return s.stmt.Query(args)
+	return s.stmt.Query(args) //nolint:staticcheck // a driver has to implement the deprecated methods of driver.Stmt
 }
 
 // ExecContext implements driver.StmtExecContext.
@@ -153,7 +161,7 @@ func (s *managedStmt) ExecContext(ctx context.Context, args []driver.NamedValue)
 	if err := s.d.gate.waitStatement(ctx, s.query, s.conn); err != nil {
 		return nil, err
 	}
-	return s.stmt.Exec(namedToValue(args))
+	return s.stmt.Exec(namedToValue(args)) //nolint:staticcheck // the statement is held as a driver.Stmt, whose methods are deprecated
 }
 
 // QueryContext implements driver.StmtQueryContext.
@@ -161,7 +169,7 @@ func (s *managedStmt) QueryContext(ctx context.Context, args []driver.NamedValue
 	if err := s.d.gate.waitStatement(ctx, s.query, s.conn); err != nil {
 		return nil, err
 	}
-	return s.stmt.Query(namedToValue(args))
+	return s.stmt.Query(namedToValue(args)) //nolint:staticcheck // the statement is held as a driver.Stmt, whose methods are deprecated
 }
 
 // namedToValue turns the arguments of a statement into the values the
@@ -326,7 +334,10 @@ func (d *Driver) checkInvariants() error {
 	}
 	d.mu.Unlock()
 	for _, c := range conns {
-		if err := d.checkConnInvariants(c.conn); err != nil {
+		c.useMu.RLock()
+		err := d.checkConnInvariants(c.conn)
+		c.useMu.RUnlock()
+		if err != nil {
 			return err
 		}
 	}
@@ -374,7 +385,7 @@ func pragmaValue(conn *sqlite3.SQLiteConn, query string) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	dest := make([]driver.Value, 1)
 	if err := rows.Next(dest); err != nil {
 		return nil, fmt.Errorf("driver: %q: %w", query, err)
