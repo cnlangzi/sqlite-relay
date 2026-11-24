@@ -297,17 +297,18 @@ The delay between a commit and the backup that holds it has three parts:
 | Part | Where it comes from | Measured |
 |---|---|---|
 | Capture delay | the notification of the WAL hook until `Scan` hands the transaction out | 84 us |
-| Merge delay | the time the consumer waits to merge transactions into a segment | the linger of the spool |
+| Merge delay | the time the consumer waits to merge transactions into a segment | the linger of the consumer that fills the spool |
 | Write delay | the time the spool needs to put the segment on the disk | the fsync of the spool |
 
 The capture delay is the part the driver is responsible for. It is 84
 microseconds at the rate of the benchmark, of which the commit itself is 29
 microseconds.
 
-The merge delay and the write delay belong to the spool. The capture delay
-is the input the linger of the spool is chosen against: a linger that is
-shorter than the capture delay buys nothing, because the transaction is not
-captured yet when the segment is closed.
+The merge delay belongs to the consumer that fills the spool, the write delay
+belongs to the spool. The capture delay is the input the linger of the
+consumer is chosen against: a linger that is shorter than the capture delay
+buys nothing, because the transaction is not captured yet when the segment is
+closed.
 
 The capture throughput of 9502 transactions per second and the WAL growth of
 4140 bytes per transaction give the size of the WAL between two
