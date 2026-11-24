@@ -30,13 +30,13 @@ func (p *Peer) gcLoop(ctx context.Context) {
 // The acknowledgement is written before the segments are removed: a segment
 // that is removed may not be sent again.
 func (p *Peer) collect(ctx context.Context) error {
-	applied := p.appliedSeq()
-	ack, err := p.sp.BackupAck()
+	ack := p.appliedSeq()
+	stored, err := p.sp.BackupAck()
 	if err != nil {
 		return err
 	}
-	if applied > ack {
-		ack = applied
+	if stored > ack {
+		ack = stored
 	}
 	if ack == p.backupSeq() {
 		return nil
@@ -51,25 +51,23 @@ func (p *Peer) collect(ctx context.Context) error {
 
 // appliedSeq returns the sequence number the backup acknowledged.
 //
-// The protocol remembers the last sequence number it saw, also from a chain
-// that was reset. Such a number belongs to a chain that does not exist any
-// more and it may not be written into the acknowledgement of the current
-// chain: the segments of the current chain would be collected before the
-// backup applied them. The number is only trusted when it changed since the
-// chain was reset.
+// The protocol reports the number of the chain it serves. It is zero when
+// the chain of the spool was reset: the number of the old chain says
+// nothing about the segments of the new one and it may not be used to
+// collect them.
 func (p *Peer) appliedSeq() uint64 {
 	seq := p.proto.AppliedSeq()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if seq != p.appliedSeen {
 		p.appliedSeen = seq
-		p.appliedTrusted = true
 		if seq > 0 {
 			p.lastAck = time.Now()
+			// The backup applies the increments of the chain of the spool:
+			// it holds the new baseline.
+			p.snapshotRequired = false
+			p.snapshotReason = ""
 		}
-	}
-	if !p.appliedTrusted {
-		return 0
 	}
 	return seq
 }

@@ -304,14 +304,16 @@ func (a *applier) Pause(ctx context.Context) error {
 		a.mu.Lock()
 		if a.idle == nil {
 			// Nothing is in flight, the file is durable.
+			next := *a.st
+			next.Paused = true
+			if err := writeState(a.statePath, &next); err != nil {
+				a.mu.Unlock()
+				return err
+			}
+			a.st.Paused = true
 			a.paused = true
 			if a.resume == nil {
 				a.resume = make(chan struct{})
-			}
-			a.st.Paused = true
-			if err := writeState(a.statePath, a.st); err != nil {
-				a.mu.Unlock()
-				return err
 			}
 			err := a.closeFile()
 			a.mu.Unlock()
@@ -344,7 +346,15 @@ func (a *applier) Resume(ctx context.Context) error {
 			return ErrSnapshotRequired
 		}
 		if a.epoch != 0 && a.st.Epoch != a.epoch {
-			return fmt.Errorf("backup: the epoch of the backup is %d, the epoch of the source is %d", a.st.Epoch, a.epoch)
+			// The chain of the source is not the chain of the backup: the
+			// database of the backup belongs to a chain that does not
+			// exist any more. The pause ends and the backup asks for a
+			// new baseline.
+			a.needsSnapshot = true
+			if err := a.endPause(); err != nil {
+				return err
+			}
+			return ErrSnapshotRequired
 		}
 		if err := a.check(); err != nil {
 			return err
@@ -361,6 +371,27 @@ func (a *applier) Resume(ctx context.Context) error {
 		}
 		a.file = f
 	}
+	if a.paused {
+		a.paused = false
+		close(a.resume)
+		a.resume = nil
+	}
+	return nil
+}
+
+// endPause ends the pause of the applier.
+//
+// The state that says that the backup is paused is cleared, the backup asks
+// for a new baseline when it connects.
+//
+// The caller holds the lock of the applier.
+func (a *applier) endPause() error {
+	next := *a.st
+	next.Paused = false
+	if err := writeState(a.statePath, &next); err != nil {
+		return err
+	}
+	a.st.Paused = false
 	if a.paused {
 		a.paused = false
 		close(a.resume)

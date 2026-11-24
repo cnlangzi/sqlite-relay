@@ -100,7 +100,15 @@ it has seen already by their position.
 A position belongs to the WAL generation it names. When SQLite resets the
 WAL, the salt of the generation changes and the frame number starts over. A
 position of an older generation does not say anything about the frames of the
-current one.
+current one. The driver forgets the acknowledged position when the
+generation changes: the frames of the old generation are written back into
+the database file, the new generation counts its frames from zero.
+
+When SQLite resets the WAL while the driver did not capture all of its
+frames, the driver reports `ErrSnapshotRequired`: the increments of the
+frames that are gone are lost and the consumer needs a new baseline. The
+frames that the WAL held before the driver started do not count: the
+consumer holds the increments it has seen already.
 
 ### The WAL space
 

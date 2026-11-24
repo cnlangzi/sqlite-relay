@@ -33,15 +33,26 @@ func startSource(t *testing.T, cfg Config, src protocol.SegmentSource, provider 
 }
 
 // startPeer opens a backup and lets it run.
+//
+// The cleanup waits for the peer to stop: the peer writes into its
+// directory, the removal of the directory must not race with it.
 func startPeer(t *testing.T, cfg Config, addr string) *Peer {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
 	p, err := Open(ctx, cfg)
 	if err != nil {
+		cancel()
 		t.Fatalf("Open: %v", err)
 	}
-	go p.Run(ctx, addr)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.Run(ctx, addr)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
 	return p
 }
 

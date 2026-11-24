@@ -121,8 +121,8 @@ type Peer struct {
 
 	// gateMu guards the state of the capture gate.
 	gateMu sync.Mutex
-	// suspended reports that the capture stands still.
-	suspended bool
+	// suspends is the number of the callers that suspended the capture.
+	suspends int
 	// resumed is closed when the capture continues. It is nil while the
 	// capture runs.
 	resumed chan struct{}
@@ -150,9 +150,6 @@ type Peer struct {
 	// appliedSeen is the sequence number the protocol reported the last
 	// time it was read.
 	appliedSeen uint64
-	// appliedTrusted reports that the sequence number of the protocol
-	// belongs to the chain of the spool.
-	appliedTrusted bool
 	// resumePos is the position the runtime continues from after a restart.
 	resumePos spool.Pos
 	// resumeSet reports that resumePos belongs to a chain.
@@ -204,6 +201,7 @@ func Open(ctx context.Context, cfg Config) (*Peer, error) {
 		// baseline.
 		broken = err.Error()
 		if err := sp.Reset(ctx); err != nil {
+			_ = sp.Close()
 			return nil, err
 		}
 	}
@@ -250,7 +248,8 @@ func Open(ctx context.Context, cfg Config) (*Peer, error) {
 // Run serves the backup and captures the increments of the primary database.
 //
 // The run ends when the context is done or when the listener fails. The
-// caller closes the listener.
+// server closes the listener when the context is done, the caller may close
+// it to stop the relay.
 func (p *Peer) Run(ctx context.Context, ln net.Listener) error {
 	rctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -330,13 +329,17 @@ func (p *Peer) Close() error {
 // The returned function starts the capture again. The producer of the
 // snapshots suspends the capture while it takes a snapshot: the snapshot and
 // the drain that follows it have to see the same transactions.
+//
+// The capture stands still until every caller that suspended it called the
+// returned function.
 func (p *Peer) Suspend(ctx context.Context) (func(), error) {
 	p.gateMu.Lock()
-	p.suspended = true
-	if p.resumed == nil {
-		p.resumed = make(chan struct{})
-	}
+	p.suspends++
 	ch := p.resumed
+	if ch == nil {
+		ch = make(chan struct{})
+		p.resumed = ch
+	}
 	end := p.roundEnd
 	p.gateMu.Unlock()
 
@@ -353,13 +356,18 @@ func (p *Peer) Suspend(ctx context.Context) (func(), error) {
 }
 
 // resumeCapture starts the capture again.
+//
+// The capture continues when every caller that suspended it resumed.
 func (p *Peer) resumeCapture(ch chan struct{}) {
 	p.gateMu.Lock()
 	defer p.gateMu.Unlock()
 	if p.resumed != ch {
 		return
 	}
-	p.suspended = false
+	p.suspends--
+	if p.suspends > 0 {
+		return
+	}
 	close(ch)
 	p.resumed = nil
 }

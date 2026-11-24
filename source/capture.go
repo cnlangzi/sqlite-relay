@@ -72,7 +72,7 @@ func (p *Peer) handleRoundError(ctx context.Context, err error) {
 func (p *Peer) captureRound(ctx context.Context) error {
 	for {
 		p.gateMu.Lock()
-		if p.suspended {
+		if p.suspends > 0 {
 			ch := p.resumed
 			p.gateMu.Unlock()
 			select {
@@ -118,10 +118,10 @@ func (p *Peer) round(ctx context.Context) error {
 			return err
 		}
 		rest, err := p.appendTo(ctx, p.transactionsOf(batch.Changes))
-		if err != nil {
+		p.setPending(rest, errors.Is(err, spool.ErrSpoolFull))
+		if err != nil && !errors.Is(err, spool.ErrSpoolFull) {
 			return err
 		}
-		p.setPending(rest)
 		full = len(rest) > 0
 	}
 
@@ -206,8 +206,10 @@ func (p *Peer) holds(pos driver.Position) bool {
 
 // appendTo writes the transactions into the spool.
 //
-// The transactions that did not fit are returned: the spool is full and they
-// are written again when it has room again.
+// The transactions that were not written are returned: they are written again
+// when the spool has room again, or when the failure that stopped the write
+// is gone. The driver does not hand them out a second time, they would be
+// lost.
 func (p *Peer) appendTo(ctx context.Context, txs []spool.Tx) ([]spool.Tx, error) {
 	for i, tx := range txs {
 		err := p.sp.Append(ctx, tx)
@@ -215,15 +217,12 @@ func (p *Peer) appendTo(ctx context.Context, txs []spool.Tx) ([]spool.Tx, error)
 			// The segment is full: it is closed and the transaction is
 			// written into the next one.
 			if ferr := p.sp.Flush(ctx); ferr != nil {
-				return nil, ferr
+				return txs[i:], ferr
 			}
 			err = p.sp.Append(ctx, tx)
 		}
-		if errors.Is(err, spool.ErrSpoolFull) {
-			return txs[i:], nil
-		}
 		if err != nil {
-			return nil, err
+			return txs[i:], err
 		}
 	}
 	return nil, nil
@@ -238,10 +237,10 @@ func (p *Peer) writePending(ctx context.Context) error {
 		return nil
 	}
 	rest, err := p.appendTo(ctx, pending)
-	if err != nil {
+	p.setPending(rest, errors.Is(err, spool.ErrSpoolFull))
+	if err != nil && !errors.Is(err, spool.ErrSpoolFull) {
 		return err
 	}
-	p.setPending(rest)
 	return nil
 }
 
@@ -253,12 +252,12 @@ func (p *Peer) hasPending() bool {
 }
 
 // setPending remembers the transactions that wait for the spool.
-func (p *Peer) setPending(txs []spool.Tx) {
+func (p *Peer) setPending(txs []spool.Tx, full bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.pending = txs
-	p.spoolFull = len(txs) > 0
-	if p.spoolFull {
+	p.spoolFull = full
+	if full {
 		p.lastErr = errSpoolFull
 		return
 	}
@@ -296,8 +295,6 @@ func (p *Peer) recoverChain(ctx context.Context, cause error) error {
 	p.snapshotReason = cause.Error()
 	// The acknowledgement of the backup belongs to the chain that is gone.
 	p.backupAckSeq = 0
-	p.appliedSeen = p.proto.AppliedSeq()
-	p.appliedTrusted = false
 	p.mu.Unlock()
 	return nil
 }

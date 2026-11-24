@@ -248,6 +248,10 @@ the database again after a restart. The resume checks the epoch of the chain
 and the connections of the business the same way it does when the backup was
 not restarted.
 
+A backup whose chain was reset while it was paused has no baseline any more.
+The pause ends and the resume reports it with `ErrSnapshotRequired`: the
+backup asks for a new baseline when it connects again.
+
 The order of a restart that falls into the window of a pause:
 
 1. The backup was paused and the state file says that it is paused.

@@ -157,6 +157,11 @@ already: an increment of the same generation that was committed at or before
 the position of the durable acknowledgement is in the spool. An increment of
 another generation is new data.
 
+The frames that the log held before the driver started belong to the
+consumer: it holds the increments it has seen already. The driver does not
+report them as lost when the log is reset, the consumer would ask for a new
+snapshot for increments it holds already.
+
 The segments that were not published when the runtime died are discarded with
 the temporary directory of the spool. Their transactions are captured again
 from the log.
@@ -174,8 +179,16 @@ needed and the runtime repairs the chain:
    it.
 3. The runtime reports that the backup needs a new baseline.
 
-The backup asks for a new snapshot in the hello of its next connection, the
-source produces one and the backup installs it over the old database.
+The session of the backup ends with the reset: the segments of the old chain
+are gone and the sequence numbers of the new chain start over, a session that
+waited for the segments of the old chain would wait for ever. The backup
+connects again, the source tells it that a new baseline is needed and the
+backup asks for a snapshot in the hello of its next connection. The source
+produces one and the backup installs it over the old database.
+
+The acknowledgement of the backup belongs to the chain it was given in. The
+source does not report the sequence number of a chain that was reset: it
+would collect the segments of the new chain before the backup applied them.
 
 ## The statistics
 

@@ -38,7 +38,10 @@ type Source struct {
 
 	mu      sync.Mutex
 	applied uint64
-	lastErr error
+	// appliedEpoch is the generation of the chain the acknowledged sequence
+	// number belongs to.
+	appliedEpoch uint64
+	lastErr      error
 }
 
 // NewSource creates a source that pushes the segments of src.
@@ -66,9 +69,18 @@ func NewSourceWithSnapshot(cfg Config, src SegmentSource, provider SnapshotProvi
 //
 // It is the highest sequence number the backup applied and persisted. It is
 // zero when the backup did not acknowledge anything yet.
+//
+// The number belongs to the chain of the session that acknowledged it. It is
+// zero when the chain of the source was reset since: the number of the old
+// chain says nothing about the segments of the new one and it may not be
+// used to collect them.
 func (s *Source) AppliedSeq() uint64 {
+	epoch := s.src.Epoch()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.appliedEpoch != epoch {
+		return 0
+	}
 	return s.applied
 }
 
@@ -131,10 +143,13 @@ func (s *Source) allowed(backupID string) bool {
 }
 
 // setApplied records the sequence number the backup acknowledged.
-func (s *Source) setApplied(seq uint64) {
+//
+// The epoch is the generation of the chain the sequence number belongs to.
+func (s *Source) setApplied(epoch, seq uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.applied = seq
+	s.appliedEpoch = epoch
 }
 
 // inflight is a segment the source sent and that the backup did not
@@ -422,6 +437,16 @@ func (sess *sourceSession) sendLoop(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		// The chain of the source was reset: the segments of the old chain
+		// are gone and the sequence numbers of the new chain start over.
+		// The backup has to ask for a new baseline, the session ends.
+		if epoch := sess.src.src.Epoch(); epoch != sess.epoch {
+			sess.mu.Lock()
+			sent := sess.sent
+			sess.mu.Unlock()
+			sess.sendResync(ResyncEpochMismatch, epoch, sent)
+			return fmt.Errorf("%w: the chain of the source is at the epoch %d, the session is at %d", ErrResyncRequired, epoch, sess.epoch)
+		}
 		sess.mu.Lock()
 		paused := sess.paused
 		pausedAck := sess.pausedAck
@@ -634,7 +659,7 @@ func (sess *sourceSession) onAck(m Ack) {
 	sess.pending, sess.unacked = dropAcked(sess.pending, sess.unacked, sess.applied)
 	applied := sess.applied
 	sess.mu.Unlock()
-	sess.src.setApplied(applied)
+	sess.src.setApplied(sess.epoch, applied)
 	sess.wakeup()
 }
 

@@ -160,6 +160,10 @@ func (d *Driver) snapshotOnce(ctx context.Context, dst string) (*Snapshot, error
 		WALOffset: walOffset(boundary, d.pageSize),
 	}
 	d.advanceCursorTo(pos)
+	// The cursor is in the generation of the log that was read. The
+	// boundary of the generation before it says nothing about the frames
+	// of this one.
+	d.setWALBoundary(boundary)
 
 	return &Snapshot{Path: dst, Bytes: info.Size(), Pos: pos}, nil
 }

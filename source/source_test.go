@@ -197,15 +197,19 @@ func TestCaptureHandsTheDurableAckToTheDriver(t *testing.T) {
 	p := startPeer(t, cfg)
 	insert(t, d, "a")
 
-	if !waitFor(t, func() bool { return p.Stats().CapturedSeq > 0 }) {
-		t.Fatal("the runtime did not capture the transactions")
-	}
-	st := p.Stats()
-	if st.Driver.AckPosition.Frame == 0 {
-		t.Error("the driver did not acknowledge the frames of the log")
-	}
-	if st.Driver.AckPosition.Salt1 != st.Driver.Generation.Salt1 {
-		t.Errorf("the acknowledged position %v does not belong to the generation %v", st.Driver.AckPosition, st.Driver.Generation)
+	// The durable acknowledgement reaches the driver. The log may be
+	// restarted in the meantime, the driver forgets the acknowledgement of
+	// the old generation then.
+	acked := false
+	if !waitFor(t, func() bool {
+		st := p.Stats()
+		if st.Driver.AckPosition.Frame > 0 {
+			acked = true
+		}
+		return acked && st.CapturedSeq > 0
+	}) {
+		t.Errorf("the runtime captured %d transactions and the driver acknowledged the frame %d, want the durable acknowledgement to reach the driver",
+			p.Stats().CapturedSeq, p.Stats().Driver.AckPosition.Frame)
 	}
 }
 
@@ -348,6 +352,53 @@ func TestCaptureResumesAfterARestart(t *testing.T) {
 	}
 }
 
+// TestCaptureKeepsTheTransactionsThatCouldNotBeWritten checks that the
+// runtime does not lose the increments when the write into the spool fails.
+//
+// The driver hands out the increments of a round only once. A transaction
+// that could not be written has to be kept, otherwise the chain continues
+// without it and the backup diverges from the primary database.
+func TestCaptureKeepsTheTransactionsThatCouldNotBeWritten(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(t, dir)
+	d, _ := newTestDriver(t, dir)
+	cfg.Driver = d
+	createTable(t, d)
+
+	p := startPeer(t, cfg)
+	insert(t, d, "a")
+	if !waitFor(t, func() bool { return len(segmentTxs(t, cfg.Spool.Root)) >= 2 }) {
+		t.Fatalf("the spool holds %d transactions, want 2", len(segmentTxs(t, cfg.Spool.Root)))
+	}
+
+	// The spool cannot write its segments any more.
+	tmp := filepath.Join(cfg.Spool.Root, testDatabaseID, "tmp")
+	if err := os.Chmod(tmp, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	insert(t, d, "b")
+
+	// The runtime reports the failure.
+	if !waitFor(t, func() bool { return p.Stats().LastError != "" }) {
+		t.Fatal("the runtime did not report the failure of the write")
+	}
+
+	// The spool can write again.
+	if err := os.Chmod(tmp, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	// The increments that could not be written are in the spool.
+	if !waitFor(t, func() bool { return len(segmentTxs(t, cfg.Spool.Root)) >= 3 }) {
+		t.Fatalf("the spool holds %d transactions, want 3", len(segmentTxs(t, cfg.Spool.Root)))
+	}
+	for i, tx := range segmentTxs(t, cfg.Spool.Root) {
+		if tx.Seq != uint64(i+1) {
+			t.Fatalf("the transaction %d has the sequence number %d, want %d", i, tx.Seq, i+1)
+		}
+	}
+}
+
 // TestSuspendStandsTheCaptureStill checks that no increment enters the spool
 // while the capture is suspended.
 func TestSuspendStandsTheCaptureStill(t *testing.T) {
@@ -374,6 +425,44 @@ func TestSuspendStandsTheCaptureStill(t *testing.T) {
 	}
 
 	resume()
+	if !waitFor(t, func() bool { return p.Stats().CapturedSeq >= 3 }) {
+		t.Errorf("the runtime captured %d transactions after the resume, want 3", p.Stats().CapturedSeq)
+	}
+}
+
+// TestSuspendCountsItsCallers checks that the capture continues only when
+// every caller that suspended it resumed.
+func TestSuspendCountsItsCallers(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(t, dir)
+	d, _ := newTestDriver(t, dir)
+	cfg.Driver = d
+	createTable(t, d)
+
+	p := startPeer(t, cfg)
+	insert(t, d, "a")
+	if !waitFor(t, func() bool { return p.Stats().CapturedSeq >= 2 }) {
+		t.Fatalf("the runtime captured %d transactions, want 2", p.Stats().CapturedSeq)
+	}
+
+	first, err := p.Suspend(context.Background())
+	if err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	second, err := p.Suspend(context.Background())
+	if err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	// The capture stands still until every caller resumed.
+	first()
+	insert(t, d, "b")
+	time.Sleep(200 * time.Millisecond)
+	if got := p.Stats().CapturedSeq; got != 2 {
+		t.Errorf("the runtime captured %d transactions, want 2", got)
+	}
+
+	second()
 	if !waitFor(t, func() bool { return p.Stats().CapturedSeq >= 3 }) {
 		t.Errorf("the runtime captured %d transactions after the resume, want 3", p.Stats().CapturedSeq)
 	}

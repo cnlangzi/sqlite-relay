@@ -128,6 +128,7 @@ type Driver struct {
 	cursor        Position
 	cursorSet     bool
 	walBoundary   uint64
+	startFrames   uint64
 	ack           Position
 	ackSet        bool
 	backfillFence int
@@ -550,9 +551,18 @@ func (d *Driver) recover() error {
 	// that were committed before the driver was started are still in the
 	// WAL and must not be lost. The consumer recognises the ones it has
 	// seen already by their position.
+	//
+	// The frames that the log held already are the business of the
+	// consumer: a reset of the log does not lose them, the consumer holds
+	// the ones it has seen.
+	frames := uint64(0)
+	if log, _, err := d.walFrames(d.ctx); err == nil && log > 0 {
+		frames = uint64(log)
+	}
 	d.mu.Lock()
 	d.cursor = Position{Salt1: hdr.Salt1, Salt2: hdr.Salt2, WALOffset: walOffset(0, d.pageSize)}
 	d.cursorSet = true
+	d.startFrames = frames
 	d.mu.Unlock()
 	return nil
 }
@@ -710,12 +720,18 @@ func (d *Driver) handleGenerationChange(hdr wal.Header) error {
 		d.clearAck()
 		return nil
 	}
-	if d.cursor.Frame < d.walBoundary {
-		return fmt.Errorf("%w: the WAL was reset with %d of %d frames uncaptured", ErrSnapshotRequired, d.walBoundary-d.cursor.Frame, d.walBoundary)
+	// The frames that the log held before the driver started are the
+	// business of the consumer: it holds the ones it has seen already.
+	// Only the frames that the driver had a chance to capture are lost
+	// when the log is reset.
+	lost := d.walBoundary - max(d.cursor.Frame, d.startFrames)
+	if lost > 0 {
+		return fmt.Errorf("%w: the WAL was reset with %d of %d frames uncaptured", ErrSnapshotRequired, lost, d.walBoundary)
 	}
 	d.cursor = Position{Salt1: hdr.Salt1, Salt2: hdr.Salt2, Frame: 0, WALOffset: walOffset(0, d.pageSize)}
 	d.cursorSet = true
 	d.walBoundary = 0
+	d.startFrames = 0
 	d.clearAck()
 	return nil
 }
@@ -747,6 +763,17 @@ func (d *Driver) noteWALBoundary(frames int) {
 	if uint64(frames) > d.walBoundary {
 		d.walBoundary = uint64(frames)
 	}
+}
+
+// setWALBoundary records the number of frames the WAL holds.
+//
+// The boundary belongs to the generation of the log that is read now. A
+// generation that is left behind does not say anything about the frames of
+// the current one.
+func (d *Driver) setWALBoundary(frames uint64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.walBoundary = frames
 }
 
 // cursorPosition returns the position the cursor is at.

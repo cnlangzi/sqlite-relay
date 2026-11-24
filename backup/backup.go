@@ -296,6 +296,10 @@ func (p *Peer) Pause(ctx context.Context) error {
 // after the sequence number the backup applied and persisted. The business
 // has to close its connections to the backup database before the resume.
 //
+// A backup whose chain was reset while it was paused has no baseline any
+// more. The pause ends and the backup asks for a new baseline, the resume
+// reports it with ErrSnapshotRequired.
+//
 // A resume that is already running returns without an error.
 func (p *Peer) Resume(ctx context.Context) error {
 	p.mu.Lock()
@@ -306,21 +310,28 @@ func (p *Peer) Resume(ctx context.Context) error {
 	p.mu.Unlock()
 
 	p.app.expectEpoch(p.proto.Epoch())
-	if err := p.app.Resume(ctx); err != nil {
+	err := p.app.Resume(ctx)
+	applied, aerr := p.app.AppliedSeq(ctx)
+	if aerr != nil {
+		return aerr
+	}
+	if err != nil && !errors.Is(err, ErrSnapshotRequired) {
 		p.setError(err)
 		return err
 	}
-	applied, err := p.app.AppliedSeq(ctx)
-	if err != nil {
-		return err
-	}
-	if err := p.proto.Resume(ctx, applied); err != nil {
-		p.setError(err)
-		return err
+	// The source pushes the increments again. A backup that needs a new
+	// baseline gets it with them.
+	if perr := p.proto.Resume(ctx, applied); perr != nil {
+		p.setError(perr)
+		return perr
 	}
 	p.mu.Lock()
 	p.paused = false
 	p.mu.Unlock()
+	if err != nil {
+		p.setError(err)
+		return err
+	}
 	return nil
 }
 

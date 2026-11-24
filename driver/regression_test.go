@@ -367,6 +367,84 @@ func TestNewGenerationIsAcknowledgedAndReclaimed(t *testing.T) {
 	waitForTruncatedWAL(t, path)
 }
 
+// TestTheBoundaryOfTheLogFollowsTheGeneration checks that the boundary of
+// the log does not survive the snapshot that moved the capture cursor.
+//
+// The boundary belongs to the generation of the log that was read. A
+// generation that is left behind does not say anything about the frames of
+// the current one: a reset of the log that lost nothing must not ask for a
+// new snapshot.
+func TestTheBoundaryOfTheLogFollowsTheGeneration(t *testing.T) {
+	d, _ := newTestDriver(t, Config{})
+	createTable(t, d)
+	insert(t, d, "a")
+	scanAll(t, d)
+
+	// The log holds more frames than the cursor captured.
+	d.mu.Lock()
+	d.walBoundary = 100
+	d.mu.Unlock()
+
+	// A snapshot moves the cursor into the current generation of the log.
+	dir := t.TempDir()
+	snap, err := d.Snapshot(context.Background(), filepath.Join(dir, "snapshot.db"))
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	d.mu.Lock()
+	boundary := d.walBoundary
+	d.mu.Unlock()
+	if boundary != snap.Pos.Frame {
+		t.Errorf("the boundary of the log is %d, want %d", boundary, snap.Pos.Frame)
+	}
+
+	// A reset of the log that lost no frame does not ask for a new
+	// snapshot.
+	next := Position{Salt1: snap.Pos.Salt1 + 1, Salt2: snap.Pos.Salt2}
+	if err := d.handleGenerationChange(wal.Header{Salt1: next.Salt1, Salt2: next.Salt2}); err != nil {
+		t.Errorf("handleGenerationChange: %v", err)
+	}
+}
+
+// TestTheFramesThatPredateTheDriverAreNotLost checks that the frames that
+// the log held before the driver started are not reported as lost.
+//
+// The consumer holds the increments that it has seen already and the driver
+// does not know which ones they are. A reset of the log does not take them
+// away from the consumer.
+func TestTheFramesThatPredateTheDriverAreNotLost(t *testing.T) {
+	d, _ := newTestDriver(t, Config{})
+	createTable(t, d)
+	insert(t, d, "a")
+	scanAll(t, d)
+
+	// The driver starts with a log that holds frames it has not captured.
+	d.mu.Lock()
+	d.cursor = Position{Salt1: 1, Salt2: 2, WALOffset: walOffset(0, d.pageSize)}
+	d.cursorSet = true
+	d.startFrames = 3
+	d.walBoundary = 3
+	d.mu.Unlock()
+
+	// A reset of the log does not report the frames of the consumer.
+	if err := d.handleGenerationChange(wal.Header{Salt1: 3, Salt2: 4}); err != nil {
+		t.Errorf("handleGenerationChange: %v", err)
+	}
+
+	// The frames that the driver had a chance to capture are lost.
+	d.mu.Lock()
+	d.cursor = Position{Salt1: 1, Salt2: 2, Frame: 1, WALOffset: walOffset(1, d.pageSize)}
+	d.cursorSet = true
+	d.startFrames = 0
+	d.walBoundary = 3
+	d.mu.Unlock()
+
+	err := d.handleGenerationChange(wal.Header{Salt1: 5, Salt2: 6})
+	if !errors.Is(err, ErrSnapshotRequired) {
+		t.Errorf("the error %v does not ask for a new snapshot", err)
+	}
+}
+
 // ackAll captures the increments of the driver and acknowledges them.
 func ackAll(t *testing.T, d *Driver) {
 	t.Helper()
