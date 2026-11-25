@@ -246,6 +246,59 @@ func TestTheResetOfTheWALIsNotReportedTwice(t *testing.T) {
 	}
 }
 
+// TestTheGenerationIsReadFromTheLogOnTheDisk checks that the driver reads
+// the generation of the log on the disk.
+//
+// The reader of the driver holds the header of the generation it opened.
+// SQLite resets the WAL while the driver holds it: a stale header would move
+// the cursor into a generation that is gone and the driver would report the
+// loss of frames that it never saw.
+func TestTheGenerationIsReadFromTheLogOnTheDisk(t *testing.T) {
+	d, path := newTestDriver(t, Config{ScanInterval: 10 * time.Millisecond})
+	createTable(t, d)
+	insert(t, d, "a")
+	scanAll(t, d)
+
+	// Another log of the same page size: its header names another
+	// generation.
+	other := filepath.Join(t.TempDir(), "other.db")
+	otherDriver, err := Open(context.Background(), Config{
+		DSN:          other + "?_journal_mode=WAL",
+		ScanInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer otherDriver.Close()
+	if _, err := otherDriver.DB().Exec("CREATE TABLE t(id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	stale, err := d.walReader()
+	if err != nil {
+		t.Fatalf("walReader: %v", err)
+	}
+	before := stale.Header()
+	header, err := os.ReadFile(other + "-wal")
+	if err != nil {
+		t.Fatalf("read the header of the other log: %v", err)
+	}
+	if err := os.WriteFile(path+"-wal", header[:wal.HeaderSize], 0o644); err != nil {
+		t.Fatalf("write the header of the log: %v", err)
+	}
+
+	reader, hdr, err := d.currentReader(stale)
+	if err != nil {
+		t.Fatalf("currentReader: %v", err)
+	}
+	if hdr.Salt1 == before.Salt1 && hdr.Salt2 == before.Salt2 {
+		t.Errorf("the driver reads the generation %d/%d, want the generation of the log on the disk", hdr.Salt1, hdr.Salt2)
+	}
+	if reader == stale {
+		t.Error("the driver reads the log with the reader of the generation that is gone")
+	}
+}
+
 // waitForWALBoundary waits until the driver knows the frame count of the
 // WAL.
 func waitForWALBoundary(t *testing.T, d *Driver) {
