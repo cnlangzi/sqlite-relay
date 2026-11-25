@@ -2,12 +2,18 @@
 
 GO ?= go
 PKGS ?= ./...
+E2E_PKGS ?= ./e2e/...
+# The work directories of the end-to-end tests live in the checkout: a
+# tmpfs does not honor fsync and the persistence barriers of the relay are
+# not told apart on it.
+SQLITE_RELAY_E2E_ROOT ?= $(CURDIR)/.e2e-root
+export SQLITE_RELAY_E2E_ROOT
 GOLANGCI_LINT_VERSION ?= v2.15.0
 GOLANGCI_LINT_PKG := github.com/golangci/golangci-lint/v2/cmd/golangci-lint
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build tests bench vet lint fmt fmt-check tools
+.PHONY: help build tests e2e bench vet lint fmt fmt-check tools
 
 help: ## Show the available targets
 	@awk -F':.*## ' '/^[a-z0-9-]+:.*## / && $$1 != "help" { printf "%-12s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -18,16 +24,21 @@ build: ## Compile every package
 tests: ## Run the tests with the race detector (PKGS=./driver/... to scope them)
 	$(GO) test -race $(PKGS)
 
+e2e: ## Run the end-to-end tests of the relay (E2E_PKGS to scope them)
+	$(GO) test -race -count=1 -timeout 25m -tags e2e $(E2E_PKGS)
+
 bench: ## Run the benchmarks
-	$(GO) test -bench . -benchmem -run '^$$' $(PKGS)
+	$(GO) test -bench . -benchmem -run '^$$' -tags e2e $(PKGS)
 
 vet: ## Run go vet
-	$(GO) vet $(PKGS)
+	$(GO) vet -tags e2e $(PKGS)
 
 lint: fmt-check ## Check formatting and run golangci-lint
 	@command -v golangci-lint >/dev/null || { echo "golangci-lint not found, run 'make tools'"; exit 1; }
 	@pinned=$$($(GO) env GOPATH)/bin/golangci-lint; \
-	if [ -x "$$pinned" ]; then "$$pinned" run $(PKGS); else golangci-lint run $(PKGS); fi
+	if [ -x "$$pinned" ]; then linter="$$pinned"; else linter=golangci-lint; fi; \
+	"$$linter" run --build-tags=e2e $(PKGS) && \
+	"$$linter" run --build-tags=e2e --tests=true $(E2E_PKGS)
 
 fmt: ## Format every file
 	gofmt -w .

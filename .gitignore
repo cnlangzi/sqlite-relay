@@ -36,5 +36,8 @@ go.work.sum
 # Local index of the CodeGraph tool
 .codegraph
 
+# The work directories of the end-to-end tests
+.e2e-root/
+
 # Workspace state of the gtw tooling
 .nightme/

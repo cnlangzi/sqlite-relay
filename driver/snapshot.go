@@ -22,6 +22,11 @@ type Snapshot struct {
 	Bytes int64
 	// Pos is the capture position the snapshot is bound to. The increments
 	// that follow this position bring the database up to date.
+	//
+	// The position is the zero position when the snapshot is not bound to
+	// a generation of the write-ahead log: the file of the database holds
+	// every committed change and the chain of the segments ends at the
+	// baseline of the snapshot.
 	Pos Position
 }
 
@@ -71,7 +76,12 @@ func (d *Driver) snapshotOnce(ctx context.Context, dst string) (*Snapshot, error
 	// where the backfill stands.
 	reader, err := wal.Open(d.walPath)
 	if err != nil {
-		return nil, fmt.Errorf("driver: open WAL: %w", err)
+		if !errors.Is(err, wal.ErrNoWAL) {
+			return nil, fmt.Errorf("driver: open WAL: %w", err)
+		}
+		// The log holds no frame: the database file holds every change
+		// that was committed. The snapshot is the file alone.
+		return d.snapshotOfFile(dst)
 	}
 	defer func() { _ = reader.Close() }()
 	scan, err := reader.Scan()
@@ -116,19 +126,8 @@ func (d *Driver) snapshotOnce(ctx context.Context, dst string) (*Snapshot, error
 
 	// Copy the database file and make sure it did not move while it was
 	// copied.
-	before, err := readBaseline(d.dbPath)
-	if err != nil {
+	if err := d.copyVerifiedFile(dst); err != nil {
 		return nil, err
-	}
-	if err := copyFile(d.dbPath, dst); err != nil {
-		return nil, err
-	}
-	after, err := readBaseline(d.dbPath)
-	if err != nil {
-		return nil, err
-	}
-	if before != after {
-		return nil, fmt.Errorf("driver: the database file changed while it was copied")
 	}
 
 	// Overlay the pages of the WAL and cut the file to the size the
@@ -166,6 +165,50 @@ func (d *Driver) snapshotOnce(ctx context.Context, dst string) (*Snapshot, error
 	d.setWALBoundary(boundary)
 
 	return &Snapshot{Path: dst, Bytes: info.Size(), Pos: pos}, nil
+}
+
+// snapshotOfFile takes a snapshot of the database file alone.
+//
+// The write-ahead log holds no frame: every committed change is in the
+// database file. The snapshot is not bound to a generation of the log: the
+// chain of the segments ends at the baseline of the snapshot.
+//
+// The cursor stands at the boundary already: a log without a frame means
+// that every change the driver captured was written back into the file.
+func (d *Driver) snapshotOfFile(dst string) (*Snapshot, error) {
+	if err := d.copyVerifiedFile(dst); err != nil {
+		return nil, err
+	}
+	if err := checkIntegrity(dst); err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		return nil, err
+	}
+	return &Snapshot{Path: dst, Bytes: info.Size()}, nil
+}
+
+// copyVerifiedFile copies the database file to dst.
+//
+// The copy has to be a file that did not move while it was copied: a
+// database that was written in the meantime is torn.
+func (d *Driver) copyVerifiedFile(dst string) error {
+	before, err := readBaseline(d.dbPath)
+	if err != nil {
+		return err
+	}
+	if err := copyFile(d.dbPath, dst); err != nil {
+		return err
+	}
+	after, err := readBaseline(d.dbPath)
+	if err != nil {
+		return err
+	}
+	if before != after {
+		return fmt.Errorf("driver: the database file changed while it was copied")
+	}
+	return nil
 }
 
 // pauseCheckpoints stops the checkpoint manager until the returned function
