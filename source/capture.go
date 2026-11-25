@@ -267,11 +267,7 @@ func (p *Peer) checkContinuity() error {
 	if ack.Seq > 0 {
 		marker = readMarker(p.markerPath())
 	}
-	verdict, err := judgeChain(ack, p.drv.Stats().CaptureCursor, marker, p.changeCounters)
-	if err != nil {
-		return err
-	}
-	switch verdict {
+	switch judgeChain(ack, p.drv.Stats().CaptureCursor, marker, p.changeCounters) {
 	case verdictUnknown:
 		return nil
 	case verdictContinuous:
@@ -287,12 +283,17 @@ func (p *Peer) checkContinuity() error {
 //
 // The counters are only read when the decision needs them: the chain and the
 // generation of the log have to be known.
-func (p *Peer) changeCounters() (primary, chain changeCounter, err error) {
+//
+// A counter of the primary database that cannot be read is unknown: the
+// decision then uses the position of the chain in the log. The failure is
+// remembered in the statistics of the runtime.
+func (p *Peer) changeCounters() (primary, chain changeCounter) {
 	value, err := p.drv.ChangeCounter()
 	if err != nil {
-		return changeCounter{}, changeCounter{}, err
+		p.setError(err)
+		return changeCounter{}, chainChangeCounter(p.sp)
 	}
-	return changeCounter{value: value, known: true}, chainChangeCounter(p.sp), nil
+	return changeCounter{value: value, known: true}, chainChangeCounter(p.sp)
 }
 
 // setContinuityChecked remembers that the continuity of the chain was

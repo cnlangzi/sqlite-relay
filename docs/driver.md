@@ -124,6 +124,11 @@ The counter does not depend on the generation of the log, so a consumer may
 compare it with the counter of a state it holds and find out whether the
 primary database is behind that state.
 
+The counter counts the writes of page 1 and not the transactions. The page 1
+images of one generation of the log carry the same counter, because the pager
+writes the counter of the database file plus one. The counter moves when the
+database file holds a newer page 1.
+
 The counter is 32 bits wide and it wraps around. Two counters are only
 comparable when fewer than 2^32 writes of page 1 lie between them.
 

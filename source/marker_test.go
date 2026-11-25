@@ -106,12 +106,9 @@ func TestJudgeChain(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := judgeChain(tc.ack, tc.cursor, tc.marker, func() (changeCounter, changeCounter, error) {
-				return tc.primary, tc.chain, nil
+			got := judgeChain(tc.ack, tc.cursor, tc.marker, func() (changeCounter, changeCounter) {
+				return tc.primary, tc.chain
 			})
-			if err != nil {
-				t.Fatalf("judgeChain: %v", err)
-			}
 			if got != tc.want {
 				t.Errorf("the verdict is %d, want %d", got, tc.want)
 			}

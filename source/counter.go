@@ -26,27 +26,34 @@ type changeCounter struct {
 
 // chainChangeCounter returns the change counter of the end of the chain.
 //
-// The counter is the one of the page 1 image of the last transaction of the
-// last published segment. It is unknown when the chain holds no segment,
-// when the segment cannot be read and when the last transaction does not
-// hold a page 1 image.
+// The counter is the one of the newest page 1 image the chain holds: the
+// image of the last transaction that wrote page 1. A transaction that does
+// not write page 1 does not move the counter.
+//
+// The segments are read from the newest to the oldest one: the chain may hold
+// a page 1 image in a segment that is not the last one. The counter is
+// unknown when the chain holds no segment, when the segments cannot be read
+// and when the chain holds no page 1 image.
 func chainChangeCounter(sp *spool.Spool) changeCounter {
 	segs, err := sp.Segments()
-	if err != nil || len(segs) == 0 {
+	if err != nil {
 		return changeCounter{}
 	}
-	seg, err := segment.ReadFile(segs[len(segs)-1].Path)
-	if err != nil || len(seg.Txs) == 0 {
-		return changeCounter{}
-	}
-	tx := seg.Txs[len(seg.Txs)-1]
-	for _, page := range tx.Pages {
-		if page.Pgno != 1 {
+	for i := len(segs) - 1; i >= 0; i-- {
+		seg, err := segment.ReadFile(segs[i].Path)
+		if err != nil {
 			continue
 		}
-		return changeCounter{
-			value: binary.BigEndian.Uint32(page.Data[changeCounterOffset : changeCounterOffset+4]),
-			known: true,
+		for j := len(seg.Txs) - 1; j >= 0; j-- {
+			for _, page := range seg.Txs[j].Pages {
+				if page.Pgno != 1 {
+					continue
+				}
+				return changeCounter{
+					value: binary.BigEndian.Uint32(page.Data[changeCounterOffset : changeCounterOffset+4]),
+					known: true,
+				}
+			}
 		}
 	}
 	return changeCounter{}

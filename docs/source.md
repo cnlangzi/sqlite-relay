@@ -274,23 +274,28 @@ The change counter is a field of the file format of SQLite: it sits at offset
 24 of the first page of the database. The pager writes the new counter into
 the page 1 image of a transaction that writes page 1.
 
-The counter of the end of the chain and the counter of the primary database
-count the same writes: the primary database is behind the chain when its
-counter is the smaller one. The counter does not depend on the generation of
-the log, so it also finds the transactions that the primary database lost when
-the log was reset.
+The counter counts the writes of page 1 and not the transactions: the page 1
+images of one generation of the log carry the same counter, because the pager
+writes the counter of the database file plus one. The counter moves when the
+database file holds a newer page 1.
 
-The counter only moves when page 1 is written. A chain of transactions that
-does not write page 1 does not move it: the position of the chain in the log
-tells in that case whether the log still holds the transactions of the chain.
+The counter of the end of the chain and the counter of the primary database
+count the same writes of page 1: the primary database is behind the chain when
+its counter is the smaller one. The counter does not depend on the generation
+of the log, so it also finds the transactions that the primary database lost
+when the log was reset.
+
+The transactions of the chain that do not write page 1 do not move the
+counter: the position of the chain in the log tells in that case whether the
+log still holds the transactions of the chain.
 
 The counter is 32 bits wide and it wraps around. A counter that wrapped is
 smaller than the counter it follows: the decision rebuilds the chain once more
 than it has to. The direction is the safe one, a chain that is rebuilt too
 often costs a snapshot and a chain that is not rebuilt when it has to be costs
-the data of the primary database. The decision misses a lost transaction only
-when the counter of the end of the chain falls into the narrow window of the
-wrap and the primary database lost its transactions within it.
+the data of the primary database. The decision misses a loss that does not
+span a write of page 1: the position of the chain in the log covers the
+losses within one generation of the log.
 
 ## The statistics
 

@@ -238,8 +238,7 @@ func setReadOnly(t *testing.T, dir string, readOnly bool) {
 // TestTheChainCounterOfTheEndOfTheChain checks the change counter of the end
 // of the chain.
 //
-// The counter is the one of the page 1 image of the last transaction of the
-// last published segment.
+// The counter is the one of the newest page 1 image the chain holds.
 func TestTheChainCounterOfTheEndOfTheChain(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(t, dir)
@@ -270,13 +269,21 @@ func TestTheChainCounterOfTheEndOfTheChain(t *testing.T) {
 	}
 
 	// The transaction that follows did not write page 1: the counter of the
-	// end of the chain is unknown.
+	// chain does not move.
 	insert(t, d, "a")
 	if !waitFor(t, func() bool { return p.Stats().CapturedSeq >= 2 }) {
 		t.Fatalf("the runtime captured %d transactions, want 2", p.Stats().CapturedSeq)
 	}
-	if c := chainChangeCounter(p.sp); c.known {
-		t.Errorf("the change counter of the chain is %d, want unknown", c.value)
+	c = chainChangeCounter(p.sp)
+	if !c.known {
+		t.Fatal("the change counter of the chain is unknown")
+	}
+	primary, err = d.ChangeCounter()
+	if err != nil {
+		t.Fatalf("ChangeCounter: %v", err)
+	}
+	if c.value != primary {
+		t.Errorf("the change counter of the chain is %d, want %d", c.value, primary)
 	}
 }
 

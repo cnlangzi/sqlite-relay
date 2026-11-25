@@ -167,38 +167,35 @@ func markerPosOf(pos spool.Pos) markerPos {
 // reset while the runtime was down may have lost the transactions that the
 // chain does not hold: the marker of the last clean close proves that it does
 // not.
-func judgeChain(ack spool.Ack, cursor driver.Position, marker *cleanMarker, counters func() (primary, chain changeCounter, err error)) (verdict, error) {
+func judgeChain(ack spool.Ack, cursor driver.Position, marker *cleanMarker, counters func() (primary, chain changeCounter)) verdict {
 	switch {
 	case ack.Seq == 0:
 		// The chain is empty, there is nothing to judge.
-		return verdictUnknown, nil
+		return verdictUnknown
 	case cursor.Salt1 == 0 && cursor.Salt2 == 0:
 		// The driver does not know the generation of the log yet.
-		return verdictUnknown, nil
+		return verdictUnknown
 	}
-	primary, chain, err := counters()
-	if err != nil {
-		return verdictUnknown, err
-	}
+	primary, chain := counters()
 	switch {
 	case primary.known && chain.known && primary.value < chain.value:
 		// The primary database is behind the end of the chain: it lost the
 		// transactions the chain holds.
-		return verdictBroken, nil
+		return verdictBroken
 	case ack.Pos.Salt1 == cursor.Salt1 && ack.Pos.Salt2 == cursor.Salt2:
 		if cursor.Frame < ack.Pos.Frame {
 			// The log holds fewer frames than the chain: the tail of the
 			// chain is gone and the primary database lost the
 			// transactions it holds.
-			return verdictBroken, nil
+			return verdictBroken
 		}
 		// The log was not reset, the chain continues where it ended.
-		return verdictContinuous, nil
+		return verdictContinuous
 	case marker != nil && marker.Seq == ack.Seq && marker.Pos == markerPosOf(ack.Pos):
 		// The log was reset after the runtime closed cleanly: the chain
 		// was complete then and the reset lost nothing.
-		return verdictContinuous, nil
+		return verdictContinuous
 	default:
-		return verdictBroken, nil
+		return verdictBroken
 	}
 }

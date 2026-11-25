@@ -22,6 +22,11 @@ const changeCounterOffset = 24
 // the image of the last committed transaction of the log that wrote page 1,
 // or the page 1 of the database file when the log holds no such image.
 //
+// The counter does not count the transactions: the page 1 images of one
+// generation of the log carry the same counter, because the pager writes the
+// counter of the database file plus one. The counter moves when the database
+// file holds a newer page 1.
+//
 // The counter is 32 bits wide and it wraps around. Two counters are only
 // comparable when fewer than 2^32 writes of page 1 lie between them.
 func (d *Driver) ChangeCounter() (uint32, error) {
@@ -61,11 +66,23 @@ func (d *Driver) changeCounterFromDisk() (uint32, error) {
 // noteChangeCounter remembers the change counter of the primary database.
 //
 // The counter of the newest page 1 image of the log wins: the counter of the
-// primary database never goes back. The database file holds the counter when
-// the log holds no page 1 image.
+// primary database never goes back. The pager writes the counter of the
+// database file plus one and the file holds a newer page 1 after every
+// checkpoint, so the cached counter stays valid when the generation of the
+// log changes.
+//
+// The database file holds the counter when the log holds no page 1 image. The
+// file is only read while the counter is unknown: its counter never goes back
+// either and the file is written by a checkpoint that may tear it.
 func (d *Driver) noteChangeCounter(scan *wal.Scan) {
 	counter, ok := newestPageOneCounter(scan)
 	if !ok {
+		d.mu.Lock()
+		known := d.changeCounterSet
+		d.mu.Unlock()
+		if known {
+			return
+		}
 		// The log holds no page 1 image: the database file holds the
 		// counter of the primary database.
 		c, err := fileChangeCounter(d.dbPath)
