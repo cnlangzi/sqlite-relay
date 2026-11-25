@@ -769,7 +769,11 @@ func (d *Driver) handleGenerationChange(hdr wal.Header) error {
 	// business of the consumer: it holds the ones it has seen already.
 	// Only the frames that the driver had a chance to capture are lost
 	// when the log is reset.
-	lost := d.walBoundary - max(d.cursor.Frame, d.startFrames)
+	reference := max(d.cursor.Frame, d.startFrames)
+	lost := uint64(0)
+	if d.walBoundary > reference {
+		lost = d.walBoundary - reference
+	}
 	boundary := d.walBoundary
 	// The cursor moves to the new generation even when the frames are
 	// lost. The consumer needs a new baseline and the driver captures the
@@ -811,6 +815,33 @@ func (d *Driver) noteWALBoundary(frames int) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if uint64(frames) > d.walBoundary {
+		d.walBoundary = uint64(frames)
+	}
+}
+
+// noteBoundary records the number of committed frames of the generation the
+// cursor is in.
+//
+// The frames of a generation start over when SQLite resets the log: the count
+// of another generation says nothing about the frames of the generation that
+// is reset. The header of the log on the disk names the generation the count
+// belongs to.
+func (d *Driver) noteBoundary(frames int) {
+	if frames < 0 {
+		return
+	}
+	hdr, err := wal.ReadHeader(d.walPath)
+	if err != nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if hdr.Salt1 != d.cursor.Salt1 || hdr.Salt2 != d.cursor.Salt2 {
+		// The log on the disk is another generation than the one the cursor
+		// is in: the count belongs to that generation.
+		return
+	}
 	if uint64(frames) > d.walBoundary {
 		d.walBoundary = uint64(frames)
 	}
@@ -895,7 +926,7 @@ func (d *Driver) tick() {
 		d.recordError(err)
 	}
 	if log, _, err := d.walFrames(ctx); err == nil && log >= 0 {
-		d.noteWALBoundary(log)
+		d.noteBoundary(log)
 		if uint64(log) > d.cursorPosition().Frame {
 			d.notify(Notification{DBName: "main", Frames: log})
 		}

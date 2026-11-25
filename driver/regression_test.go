@@ -299,6 +299,55 @@ func TestTheGenerationIsReadFromTheLogOnTheDisk(t *testing.T) {
 	}
 }
 
+// TestTheFramesOfAnotherGenerationAreNotLost checks that the driver does not
+// report the frames of another generation as a loss.
+//
+// SQLite resets the log when the frames of the old generation are written
+// back into the database file. The frames of the new generation start over:
+// they are not lost when the log is reset. A driver that counts them reports
+// a loss that never happened and the consumer rebuilds its chain over and
+// over.
+func TestTheFramesOfAnotherGenerationAreNotLost(t *testing.T) {
+	d, path := newTestDriver(t, Config{ScanInterval: 10 * time.Millisecond})
+	createTable(t, d)
+	insert(t, d, "a")
+	scanAll(t, d)
+
+	// The driver captured every frame of the generation the cursor is in.
+	d.mu.Lock()
+	d.walBoundary = d.cursor.Frame
+	d.mu.Unlock()
+
+	// The log on the disk names another generation: the frames the periodic
+	// scan counts belong to that generation.
+	other := filepath.Join(t.TempDir(), "other.db")
+	otherDriver, err := Open(context.Background(), Config{
+		DSN:          other + "?_journal_mode=WAL",
+		ScanInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer otherDriver.Close()
+	if _, err := otherDriver.DB().Exec("CREATE TABLE t(id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	header, err := os.ReadFile(other + "-wal")
+	if err != nil {
+		t.Fatalf("read the header of the other log: %v", err)
+	}
+	if err := os.WriteFile(path+"-wal", header[:wal.HeaderSize], 0o644); err != nil {
+		t.Fatalf("write the header of the log: %v", err)
+	}
+
+	d.noteBoundary(1000)
+
+	hdr := wal.Header{Salt1: 1, Salt2: 2}
+	if err := d.handleGenerationChange(hdr); err != nil {
+		t.Fatalf("the driver reported the frames of another generation as a loss: %v", err)
+	}
+}
+
 // waitForWALBoundary waits until the driver knows the frame count of the
 // WAL.
 func waitForWALBoundary(t *testing.T, d *Driver) {

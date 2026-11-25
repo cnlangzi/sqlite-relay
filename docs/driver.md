@@ -108,7 +108,9 @@ When SQLite resets the WAL while the driver did not capture all of its
 frames, the driver reports `ErrSnapshotRequired`: the increments of the
 frames that are gone are lost and the consumer needs a new baseline. The
 frames that the WAL held before the driver started do not count: the
-consumer holds the increments it has seen already.
+consumer holds the increments it has seen already. Only the frames of the
+generation that is reset count: the frames of the new generation start
+over and they are not lost.
 
 The driver reports the loss once and it continues in the new generation: it
 captures the frames of the new generation from its first frame. The consumer
