@@ -187,6 +187,32 @@ as well.
 
 The snapshot path does not need the quiesce gate.
 
+### The statistics
+
+`Stats` reports the state of the driver: the generation of the log, the
+capture cursor, the acknowledged position, the frames of the log, the
+checkpoint, the reclaim and the last error.
+
+| Field | Meaning |
+|---|---|
+| `Notifications` | the number of commit notifications the WAL hook delivered to the consumer |
+| `DroppedNotifications` | the number of notifications that the full channel of the notifications did not take |
+| `ScanCompensations` | the number of capture rounds that returned transactions that no notification announced |
+| `CommitFrames` | the number of frames of the current generation of the log that are committed: the boundary of the last complete transaction |
+| `WALFrames` | the number of frames SQLite reports for the log |
+
+The counters tell how the commits of the primary database reached the
+consumer. A notification that the full channel did not take costs a wake-up:
+the periodic scan finds the commit anyway, and the round that found it is
+counted as a scan compensation.
+
+`CommitFrames` and `WALFrames` answer the same question from two sides.
+`CommitFrames` is the boundary the driver read out of the bytes of the log
+while it captured, `WALFrames` is the number of frames SQLite reports for
+the log at the moment the statistics are taken. The two agree unless the log
+moved between the two reads. The frames of a transaction that did not commit
+are in neither of them.
+
 ## Not supported
 
 The driver relies on being the only one that touches the primary database.

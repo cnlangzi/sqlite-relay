@@ -162,3 +162,27 @@ func waitFor(t *testing.T, cond func() bool) bool {
 	}
 	return cond()
 }
+
+// testSink is the sink of a backup that connects to the runtime.
+//
+// The sink applies nothing: it is the connection to the runtime that the
+// tests look at.
+type testSink struct {
+	// epoch is the generation of the chain the sink is part of.
+	epoch uint64
+}
+
+// Apply applies a transaction of the chain.
+func (s *testSink) Apply(ctx context.Context, tx segment.Tx) error {
+	return nil
+}
+
+// AppliedSeq returns the sequence number the sink applied.
+func (s *testSink) AppliedSeq(ctx context.Context) (uint64, error) {
+	return 0, nil
+}
+
+// Epoch returns the generation of the chain the sink is part of.
+func (s *testSink) Epoch() uint64 {
+	return s.epoch
+}

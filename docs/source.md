@@ -248,6 +248,9 @@ runtime judges the chain when it starts, see
 | `LagSeq` | the number of the sequence numbers the backup did not acknowledge yet |
 | `Lag` | the time since the last acknowledgement of the backup |
 | `LastAck` | the time of the last acknowledgement of the backup |
+| `Connected` | a backup is on the line |
+| `Sessions` | the number of the sessions the source accepted since it started |
+| `Resyncs` | the number of the resyncs the source asked the backup for since it started |
 | `SpoolFull` | the spool reached its limit and the capture stands still |
 | `SnapshotRequired` | the chain is broken and the backup needs a new baseline |
 | `SnapshotReason` | why the chain is broken |

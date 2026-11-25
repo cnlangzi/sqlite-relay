@@ -100,6 +100,14 @@ type Stats struct {
 	Lag time.Duration
 	// LastAck is the time of the last acknowledgement of the backup.
 	LastAck time.Time
+	// Connected reports that a backup is on the line.
+	Connected bool
+	// Sessions is the number of the sessions the source accepted since it
+	// started.
+	Sessions uint64
+	// Resyncs is the number of the resyncs the source asked the backup
+	// for since it started.
+	Resyncs uint64
 	// SpoolFull reports that the spool reached its limit and that the
 	// capture stands still.
 	SpoolFull bool
@@ -315,6 +323,9 @@ func (p *Peer) Stats() Stats {
 
 	st.Driver = p.drv.Stats()
 	st.Spool = p.sp.Stats()
+	st.Connected = p.proto.Connected()
+	st.Sessions = p.proto.Sessions()
+	st.Resyncs = p.proto.Resyncs()
 	st.CapturedSeq = st.Spool.DurableSeq
 	if st.CapturedSeq > st.BackupSeq {
 		st.LagSeq = st.CapturedSeq - st.BackupSeq
