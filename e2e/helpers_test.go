@@ -1141,7 +1141,14 @@ func waitFor(timeout time.Duration, cond func() bool) bool {
 //
 // The condition has to hold for a moment: the capture of the source runs
 // after the commit of the business, a sample may be taken before the last
-// transaction reached the spool.
+// transaction reached the spool. The source must not capture anything during
+// that moment: a transaction that is committed but not captured yet is
+// missing on the backup.
+//
+// The source has to capture the whole log before the two sides are in line:
+// the transactions that are still in the log are not on the backup. The
+// statistics of the source are a snapshot: a capture round that runs while
+// the source writes into the spool is not visible in them.
 //
 // The source holds the transactions that did not fit into the spool in its
 // memory: they are not durable and the backup does not have them yet. The
@@ -1149,10 +1156,25 @@ func waitFor(timeout time.Duration, cond func() bool) bool {
 func (r *relay) waitCatchUp() {
 	r.t.Helper()
 	since := time.Time{}
+	seq := uint64(0)
+	frame := uint64(0)
 	if !waitFor(catchUpTimeout, func() bool {
 		src := r.sourceStats()
 		bck := r.backupStats()
 		if src.CapturedSeq != bck.AppliedSeq || src.BackupSeq != src.CapturedSeq || src.SpoolFull {
+			since = time.Time{}
+			return false
+		}
+		if src.Driver.CaptureCursor.Frame < uint64(src.Driver.WALFrames) {
+			// The source did not capture the whole log yet.
+			since = time.Time{}
+			return false
+		}
+		if src.CapturedSeq != seq || src.Driver.CaptureCursor.Frame != frame {
+			// The source captured more: the backup has to apply it before
+			// the two sides are in line.
+			seq = src.CapturedSeq
+			frame = src.Driver.CaptureCursor.Frame
 			since = time.Time{}
 			return false
 		}
