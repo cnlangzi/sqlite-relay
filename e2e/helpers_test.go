@@ -638,7 +638,7 @@ func (p *primary) serve() {
 				p.close()
 				return
 			}
-			fmt.Fprintln(os.Stdout, p.handle(line))
+			_, _ = fmt.Fprintln(os.Stdout, p.handle(line))
 		}
 	}
 }
@@ -863,7 +863,7 @@ func readRows(db *sql.DB, query string) (rows, error) {
 	if err != nil {
 		return rows{}, err
 	}
-	defer res.Close()
+	defer func() { _ = res.Close() }()
 	columns, err := res.Columns()
 	if err != nil {
 		return rows{}, err
@@ -994,7 +994,7 @@ func (b *backupSide) serve() {
 				b.close()
 				return
 			}
-			fmt.Fprintln(os.Stdout, b.handle(line))
+			_, _ = fmt.Fprintln(os.Stdout, b.handle(line))
 		}
 	}
 }
@@ -1176,7 +1176,7 @@ func (r *relay) openBackupDB() *sql.DB {
 func (r *relay) queryBackup(query string) rows {
 	r.t.Helper()
 	db := r.openBackupDB()
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	res, err := readRows(db, query)
 	if err != nil {
 		r.t.Fatalf("the query %q on the backup: %v", query, err)
@@ -1208,7 +1208,7 @@ func (r *relay) compare() {
 func (r *relay) checkIntegrity() {
 	r.t.Helper()
 	db := r.openBackupDB()
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	var result string
 	if err := db.QueryRow("PRAGMA integrity_check").Scan(&result); err != nil {
 		r.t.Fatalf("the integrity check of the backup: %v", err)

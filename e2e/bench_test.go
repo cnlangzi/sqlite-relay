@@ -56,7 +56,7 @@ func BenchmarkTheRelayUnderLoad(b *testing.B) {
 			if err != nil {
 				b.Fatalf("open the driver: %v", err)
 			}
-			defer drv.Close()
+			defer func() { _ = drv.Close() }()
 			if _, err := drv.DB().Exec(createAccounts); err != nil {
 				b.Fatalf("create the table: %v", err)
 			}
@@ -80,13 +80,13 @@ func BenchmarkTheRelayUnderLoad(b *testing.B) {
 				if err != nil {
 					b.Fatalf("open the source: %v", err)
 				}
-				defer peer.Close()
+				defer func() { _ = peer.Close() }()
 				ln, err := net.Listen("tcp", "127.0.0.1:0")
 				if err != nil {
 					b.Fatalf("listen: %v", err)
 				}
-				defer ln.Close()
-				go peer.Run(ctx, ln)
+				defer func() { _ = ln.Close() }()
+				go func() { _ = peer.Run(ctx, ln) }()
 
 				if c.backup {
 					bpeer, err := backup.Open(ctx, backup.Config{
@@ -101,7 +101,7 @@ func BenchmarkTheRelayUnderLoad(b *testing.B) {
 					if err != nil {
 						b.Fatalf("open the backup: %v", err)
 					}
-					go bpeer.Run(ctx, ln.Addr().String())
+					go func() { _ = bpeer.Run(ctx, ln.Addr().String()) }()
 				}
 			}
 
