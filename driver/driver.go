@@ -783,16 +783,6 @@ func (d *Driver) cursorPosition() Position {
 	return d.cursor
 }
 
-// ackPosition returns the position the consumer acknowledged.
-//
-// The position is the zero position when the consumer did not acknowledge
-// anything yet.
-func (d *Driver) ackPosition() Position {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.ack
-}
-
 // advanceCursorTo moves the cursor to the given position.
 func (d *Driver) advanceCursorTo(pos Position) {
 	d.mu.Lock()

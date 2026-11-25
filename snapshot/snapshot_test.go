@@ -211,6 +211,62 @@ func waitFor(t *testing.T, cond func() bool) bool {
 	return cond()
 }
 
+// TestTheSnapshotOfADatabaseWithoutAWriteAheadLog checks that the producer
+// takes a snapshot when the write-ahead log of the primary database is gone.
+//
+// SQLite deletes the log when the last connection to the database closes.
+// The chain of the spool holds the transactions that were captured before
+// the close: the file of the database holds them as well and the snapshot is
+// the baseline of the chain that follows them.
+func TestTheSnapshotOfADatabaseWithoutAWriteAheadLog(t *testing.T) {
+	d, path := newTestDriver(t)
+	sp := newTestSpool(t, t.TempDir())
+	cap := newCapture(d, sp)
+	createTable(t, d)
+	insert(t, d, "first")
+
+	// The chain holds the transaction of the insert.
+	if !waitFor(t, func() bool {
+		ack, err := sp.Durable()
+		return err == nil && ack.Seq >= 2
+	}) {
+		ack, _ := sp.Durable()
+		t.Fatalf("the chain holds the sequence number %d, want at least 2", ack.Seq)
+	}
+
+	// The primary database closes: SQLite deletes the log.
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	d2, err := driver.Open(context.Background(), driver.Config{
+		DSN:          path + "?_journal_mode=WAL",
+		ScanInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d2.Close()
+
+	dir := t.TempDir()
+	p, err := New(Config{Dir: dir, DatabaseID: "app.db", StreamID: 1}, d2, sp, cap)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	meta, r, err := p.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	defer r.Close()
+	if meta.BaselineSeq == 0 {
+		t.Fatal("the snapshot has no baseline")
+	}
+
+	// The snapshot holds the state of the primary database.
+	if got := rows(t, theSnapshotFile(t, dir)); len(got) != 1 || got[0] != "first" {
+		t.Errorf("the snapshot holds %v, want the rows of the primary", got)
+	}
+}
+
 func TestSnapshotIsBoundToTheLastTransactionOfTheChain(t *testing.T) {
 	d, _ := newTestDriver(t)
 	sp := newTestSpool(t, t.TempDir())

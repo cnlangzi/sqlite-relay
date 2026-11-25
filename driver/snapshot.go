@@ -23,9 +23,10 @@ type Snapshot struct {
 	// Pos is the capture position the snapshot is bound to. The increments
 	// that follow this position bring the database up to date.
 	//
-	// The snapshot of a database whose write-ahead log holds no frame is
-	// bound to the position the consumer acknowledged: the log holds no
-	// frame, the position names the last frame that is in the file.
+	// The position is the zero position when the snapshot is not bound to
+	// a generation of the write-ahead log: the file of the database holds
+	// every committed change and the chain of the segments ends at the
+	// baseline of the snapshot.
 	Pos Position
 }
 
@@ -169,8 +170,11 @@ func (d *Driver) snapshotOnce(ctx context.Context, dst string) (*Snapshot, error
 // snapshotOfFile takes a snapshot of the database file alone.
 //
 // The write-ahead log holds no frame: every committed change is in the
-// database file. The boundary of the snapshot is the position the consumer
-// acknowledged: the frames up to it were written back into the file.
+// database file. The snapshot is not bound to a generation of the log: the
+// chain of the segments ends at the baseline of the snapshot.
+//
+// The cursor stands at the boundary already: a log without a frame means
+// that every change the driver captured was written back into the file.
 func (d *Driver) snapshotOfFile(dst string) (*Snapshot, error) {
 	if err := d.copyVerifiedFile(dst); err != nil {
 		return nil, err
@@ -182,7 +186,7 @@ func (d *Driver) snapshotOfFile(dst string) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Snapshot{Path: dst, Bytes: info.Size(), Pos: d.ackPosition()}, nil
+	return &Snapshot{Path: dst, Bytes: info.Size()}, nil
 }
 
 // copyVerifiedFile copies the database file to dst.

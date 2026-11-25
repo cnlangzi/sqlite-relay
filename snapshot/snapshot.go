@@ -210,6 +210,12 @@ func (p *Producer) drain(ctx context.Context, ack spool.Ack, boundary driver.Pos
 		// that follows it.
 		return nil
 	}
+	if boundary.Salt1 == 0 && boundary.Salt2 == 0 {
+		// The snapshot is not bound to a generation of the write-ahead log:
+		// the file of the database holds every change that was committed
+		// and the chain ends at the baseline of the snapshot.
+		return nil
+	}
 	if ack.Pos.Salt1 != boundary.Salt1 || ack.Pos.Salt2 != boundary.Salt2 {
 		return fmt.Errorf("%w: the write-ahead log was reset while the snapshot was taken", errRetry)
 	}

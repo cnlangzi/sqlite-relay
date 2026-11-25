@@ -207,6 +207,9 @@ func TestTheSnapshotOfADatabaseWithoutAWriteAheadLog(t *testing.T) {
 	if snap.Bytes == 0 {
 		t.Error("the snapshot holds no bytes")
 	}
+	if snap.Pos != (Position{}) {
+		t.Errorf("the snapshot is bound to the position %s, want no position", snap.Pos)
+	}
 	if err := checkIntegrity(snapPath); err != nil {
 		t.Errorf("the snapshot is not a valid database: %v", err)
 	}
