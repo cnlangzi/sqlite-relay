@@ -101,7 +101,8 @@ func (s *Source) LastError() error {
 // Connected reports whether a backup is on the line.
 //
 // The source serves one connection at a time: the backup is connected while
-// its session runs.
+// its session runs, the handshake is over and the source pushes the segments
+// of the chain.
 func (s *Source) Connected() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
