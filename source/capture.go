@@ -193,6 +193,37 @@ func (p *Peer) transactionsOf(changes []driver.Change) []spool.Tx {
 	return out
 }
 
+// captureTheRest captures the transactions that were committed after the last
+// round of the capture.
+//
+// The chain may only be marked as complete when it holds every transaction
+// the driver captured: a transaction that the chain does not hold and that
+// the reset of the log destroys is a hole in the chain.
+//
+// The scan stops when the driver hands out nothing new. A business that keeps
+// writing holds the runtime up until the context of the close is done.
+func (p *Peer) captureTheRest(ctx context.Context) error {
+	for {
+		batch, err := p.drv.Scan(ctx)
+		if err != nil {
+			return err
+		}
+		if len(batch.Changes) == 0 {
+			return nil
+		}
+		rest, err := p.appendTo(ctx, p.transactionsOf(batch.Changes))
+		p.setPending(rest, errors.Is(err, spool.ErrSpoolFull))
+		if err != nil && !errors.Is(err, spool.ErrSpoolFull) {
+			return err
+		}
+		if len(rest) > 0 {
+			// The spool is full: the transactions that did not fit are
+			// not in the chain.
+			return nil
+		}
+	}
+}
+
 // holds reports whether the spool holds the increment at pos already.
 //
 // The position of the resume is the position of the last transaction that

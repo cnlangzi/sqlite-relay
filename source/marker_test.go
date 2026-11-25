@@ -200,6 +200,98 @@ func TestTheCloseDoesNotMarkAChainWhoseBarrierDidNotRun(t *testing.T) {
 	}
 }
 
+// TestTheCloseCapturesTheTransactionsThatFollowTheLastRound checks that the
+// chain holds the transactions that were committed after the last round of
+// the capture.
+//
+// A transaction that the chain does not hold and that the reset of the log
+// destroys is a hole in the chain.
+func TestTheCloseCapturesTheTransactionsThatFollowTheLastRound(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(t, dir)
+	d, _ := newTestDriver(t, dir)
+	cfg.Driver = d
+	createTable(t, d)
+
+	p := startPeer(t, cfg)
+	insert(t, d, "a")
+	if !waitFor(t, func() bool { return p.Stats().CapturedSeq >= 2 }) {
+		t.Fatalf("the runtime captured %d transactions, want 2", p.Stats().CapturedSeq)
+	}
+
+	// The capture stands still: the transaction is committed but it is not
+	// captured.
+	if _, err := p.Suspend(context.Background()); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	insert(t, d, "b")
+	time.Sleep(200 * time.Millisecond)
+	if got := p.Stats().CapturedSeq; got != 2 {
+		t.Fatalf("the runtime captured %d transactions, want 2", got)
+	}
+
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	ack, err := p.sp.Durable()
+	if err != nil {
+		t.Fatalf("the durable acknowledgement of the spool: %v", err)
+	}
+	if ack.Seq != 3 {
+		t.Errorf("the chain ends at the sequence number %d, want 3", ack.Seq)
+	}
+	m := readMarker(p.markerPath())
+	if m == nil {
+		t.Fatal("the runtime did not write the marker")
+	}
+	if m.Seq != ack.Seq {
+		t.Errorf("the marker names the sequence number %d, want %d", m.Seq, ack.Seq)
+	}
+}
+
+// TestTheMarkerStaysWhenTheChainDoesNotMove checks that the marker of the
+// last clean close survives a runtime that captures nothing.
+//
+// The chain is the chain the marker describes: the marker stays accurate.
+func TestTheMarkerStaysWhenTheChainDoesNotMove(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(t, dir)
+	d, path := newTestDriver(t, dir)
+	cfg.Driver = d
+	createTable(t, d)
+	insert(t, d, "a")
+
+	p := startPeer(t, cfg)
+	if !waitFor(t, func() bool { return p.Stats().CapturedSeq >= 2 }) {
+		t.Fatalf("the runtime captured %d transactions, want 2", p.Stats().CapturedSeq)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	marker := readMarker(p.markerPath())
+	if marker == nil {
+		t.Fatal("the runtime did not write the marker")
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close the driver: %v", err)
+	}
+
+	// The runtime starts again and closes without capturing anything.
+	d2 := reopenTestDriver(t, path)
+	cfg.Driver = d2
+	p2 := startPeer(t, cfg)
+	if err := p2.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	m := readMarker(p2.markerPath())
+	if m == nil {
+		t.Fatal("the runtime removed the marker of the chain it did not touch")
+	}
+	if *m != *marker {
+		t.Errorf("the marker is %+v, want %+v", *m, *marker)
+	}
+}
+
 // TestTheChainContinuesAcrossAGenerationChange checks that the chain of the
 // segments survives the reset of the write-ahead log.
 //

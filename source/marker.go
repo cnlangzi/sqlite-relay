@@ -59,13 +59,19 @@ const (
 	verdictBroken
 )
 
-// markerPath returns the path of the file that holds the marker of a clean
+// markerPathOf returns the path of the file that holds the marker of a clean
 // close.
 //
 // The marker lives in the directory of the database of the spool: the spool
 // does not know it and it does not touch it.
+func markerPathOf(cfg Config) string {
+	return filepath.Join(cfg.Spool.Root, cfg.Protocol.DatabaseID, markerFile)
+}
+
+// markerPath returns the path of the file that holds the marker of a clean
+// close.
 func (p *Peer) markerPath() string {
-	return filepath.Join(p.cfg.Spool.Root, p.cfg.Protocol.DatabaseID, markerFile)
+	return markerPathOf(p.cfg)
 }
 
 // readMarker reads the marker of a clean close.
@@ -107,7 +113,7 @@ func writeMarker(path string, m cleanMarker) error {
 	}
 	if err := file.Chmod(0o644); err != nil {
 		_ = file.Close()
-		return fmt.Errorf("source: write the marker: %w", err)
+		return fmt.Errorf("source: set the permissions of the marker: %w", err)
 	}
 	if err := file.Sync(); err != nil {
 		_ = file.Close()

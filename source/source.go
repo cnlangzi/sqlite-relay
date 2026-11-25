@@ -157,6 +157,8 @@ type Peer struct {
 	appliedSeen uint64
 	// resumePos is the position the runtime continues from after a restart.
 	resumePos spool.Pos
+	// resumeSeq is the sequence number the runtime continues from.
+	resumeSeq uint64
 	// resumeSet reports that resumePos belongs to a chain.
 	resumeSet bool
 	// continuityChecked reports that the continuity of the chain was
@@ -212,6 +214,11 @@ func Open(ctx context.Context, cfg Config) (*Peer, error) {
 			_ = sp.Close()
 			return nil, err
 		}
+		// The marker describes the chain that is gone.
+		if err := removeMarker(markerPathOf(cfg)); err != nil {
+			_ = sp.Close()
+			return nil, err
+		}
 	}
 
 	p := &Peer{cfg: cfg, drv: cfg.Driver, sp: sp}
@@ -242,6 +249,7 @@ func Open(ctx context.Context, cfg Config) (*Peer, error) {
 	}
 	if ack.Seq > 0 {
 		p.resumePos = ack.Pos
+		p.resumeSeq = ack.Seq
 		p.resumeSet = true
 	}
 	if broken != "" {
@@ -320,9 +328,17 @@ func (p *Peer) Stats() Stats {
 // Close stops the runtime and releases the spool.
 //
 // The runtime writes the transactions that are still pending into the spool,
-// it publishes the segments and it marks the chain of the segments as
-// complete. The marker tells the next runtime that the chain covers the
-// primary database.
+// it captures the transactions that were committed after the last round, it
+// publishes the segments and it marks the chain of the segments as complete.
+// The marker tells the next runtime that the chain covers the primary
+// database.
+//
+// The application has to stop writing to the primary database before it
+// closes the runtime: a transaction that is committed afterwards is not in
+// the chain.
+//
+// Close does not report a failure: the state of the chain is reported in the
+// statistics of the runtime.
 //
 // The driver is not closed: the application owns it.
 func (p *Peer) Close() error {
@@ -353,6 +369,11 @@ func (p *Peer) finishChain(ctx context.Context) error {
 	if err := p.writePending(ctx); err != nil {
 		return err
 	}
+	// The capture stands still: the transactions that were committed after
+	// the last round are not in the chain yet.
+	if err := p.captureTheRest(ctx); err != nil {
+		return err
+	}
 	if err := p.sp.Flush(ctx); err != nil {
 		return err
 	}
@@ -375,22 +396,44 @@ func (p *Peer) finishChain(ctx context.Context) error {
 		return removeMarker(p.markerPath())
 	}
 	cursor := p.drv.Stats().CaptureCursor
-	reason := ""
 	switch {
 	case p.hasPending():
-		reason = "the transactions that did not fit into the spool are not in the chain"
-	case !samePosition(ack.Pos, cursor):
-		reason = "the chain does not end where the driver captured up to"
+		return p.discardMarker("the transactions that did not fit into the spool are not in the chain")
+	case samePosition(ack.Pos, cursor):
+		// The chain ends where the driver captured up to: it covers the
+		// primary database.
+		return writeMarker(p.markerPath(), cleanMarker{Seq: ack.Seq, Pos: markerPosOf(ack.Pos)})
+	case p.chainUnchanged(ack):
+		// The driver captured nothing and the chain did not move since the
+		// runtime started: the marker of the last clean close describes
+		// the chain and it stays.
+		return nil
+	default:
+		return p.discardMarker("the chain does not end where the driver captured up to")
 	}
-	if reason != "" {
-		// The chain does not cover the primary database: the marker of the
-		// last clean close does not describe the chain any more.
-		if err := removeMarker(p.markerPath()); err != nil {
-			return err
-		}
-		return fmt.Errorf("%w: %s", errChainIncomplete, reason)
+}
+
+// discardMarker removes the marker of the last clean close and reports that
+// the chain does not cover the primary database.
+func (p *Peer) discardMarker(reason string) error {
+	if err := removeMarker(p.markerPath()); err != nil {
+		return err
 	}
-	return writeMarker(p.markerPath(), cleanMarker{Seq: ack.Seq, Pos: markerPosOf(ack.Pos)})
+	return fmt.Errorf("%w: %s", errChainIncomplete, reason)
+}
+
+// chainUnchanged reports whether the chain of the segments is the chain the
+// runtime continued from.
+//
+// The marker of the last clean close describes that chain: it stays accurate
+// as long as the chain does not move.
+func (p *Peer) chainUnchanged(ack spool.Ack) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.resumeSet {
+		return false
+	}
+	return ack.Seq == p.resumeSeq && samePosition(ack.Pos, toDriverPos(p.resumePos))
 }
 
 // Suspend stops the capture and waits for the round that is running to end.

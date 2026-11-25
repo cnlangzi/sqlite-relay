@@ -203,7 +203,8 @@ The order of the shutdown decides whether the chain survives the restart:
 
 1. The business stops writing to the primary database.
 2. The runtime is closed. It writes the transactions that are still pending
-   into the spool, it publishes the segments and it writes the marker.
+   into the spool, it captures the transactions that were committed after the
+   last round, it publishes the segments and it writes the marker.
 3. The driver is closed. The application closes it, the runtime does not.
 
 ## The chain that breaks
