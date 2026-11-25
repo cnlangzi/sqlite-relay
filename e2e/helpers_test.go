@@ -26,6 +26,7 @@ import (
 
 	"github.com/cnlangzi/sqlite-relay/backup"
 	"github.com/cnlangzi/sqlite-relay/driver"
+	"github.com/cnlangzi/sqlite-relay/internal/wal"
 	"github.com/cnlangzi/sqlite-relay/protocol"
 	"github.com/cnlangzi/sqlite-relay/source"
 	"github.com/cnlangzi/sqlite-relay/spool"
@@ -118,6 +119,14 @@ type settings struct {
 	// Retention is the time a segment of the spool is kept after the
 	// backup acknowledged it. It is given in seconds.
 	Retention int64 `json:"retention"`
+	// ReclaimInterval is the interval of the reclaim of the write-ahead log
+	// of the primary database. It is given in seconds. Zero means the
+	// default of the driver.
+	//
+	// A reclaim writes the whole log back into the database file and it
+	// empties the log: the frames of the log are gone afterwards. A test
+	// that truncates the log needs the frames of the log.
+	ReclaimInterval int64 `json:"reclaimInterval"`
 	// Synchronous is the synchronous pragma of the primary database: OFF,
 	// NORMAL or FULL.
 	Synchronous string `json:"synchronous"`
@@ -343,6 +352,23 @@ func (r *relay) segmentFiles() []string {
 	return out
 }
 
+// truncateWAL cuts the tail of the write-ahead log of the primary database.
+//
+// The frames of the log are lost: the primary database lost the transactions
+// that were committed at the end of the log.
+func truncateWAL(t *testing.T, path string) error {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	size := int64(wal.HeaderSize + 16)
+	if info.Size() < size {
+		size = info.Size()
+	}
+	return os.Truncate(path, size)
+}
+
 // do sends a command to a process and returns the payload of the answer.
 //
 // A command that failed is an error: the message of the failure holds the
@@ -533,11 +559,15 @@ func runPrimary() {
 	if set.Synchronous != "" {
 		dsn += "&_synchronous=" + set.Synchronous
 	}
+	reclaimInterval := time.Duration(set.ReclaimInterval) * time.Second
+	if reclaimInterval <= 0 {
+		reclaimInterval = 20 * time.Millisecond
+	}
 	drv, err := driver.Open(ctx, driver.Config{
 		DSN:             dsn,
 		ScanInterval:    20 * time.Millisecond,
 		ReclaimBytes:    1 << 20,
-		ReclaimInterval: 20 * time.Millisecond,
+		ReclaimInterval: reclaimInterval,
 		ReclaimTimeout:  10 * time.Second,
 	})
 	if err != nil {

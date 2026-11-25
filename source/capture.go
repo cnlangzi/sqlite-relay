@@ -247,8 +247,10 @@ func (p *Peer) holds(pos driver.Position) bool {
 //
 // The decision is made once: the generations that come after are the business
 // of the driver, it reports the ones it cannot capture. The chain is broken
-// when the log was reset while the runtime was down and the marker of the
-// last clean close does not prove that the chain was complete then.
+// when the primary database is behind the end of the chain, when the log lost
+// the frames of the chain and when the log was reset while the runtime was
+// down and the marker of the last clean close does not prove that the chain
+// was complete then.
 func (p *Peer) checkContinuity() error {
 	p.mu.Lock()
 	checked := p.continuityChecked
@@ -265,15 +267,32 @@ func (p *Peer) checkContinuity() error {
 	if ack.Seq > 0 {
 		marker = readMarker(p.markerPath())
 	}
-	switch judgeChain(ack, p.drv.Stats().Generation, marker) {
+	verdict, err := judgeChain(ack, p.drv.Stats().CaptureCursor, marker, p.changeCounters)
+	if err != nil {
+		return err
+	}
+	switch verdict {
 	case verdictUnknown:
 		return nil
 	case verdictContinuous:
 		p.setContinuityChecked()
 		return nil
 	default:
-		return fmt.Errorf("%w: the log was reset and the chain does not prove that it covers the primary database", errChainBroken)
+		return fmt.Errorf("%w: the chain does not prove that it covers the primary database", errChainBroken)
 	}
+}
+
+// changeCounters reads the change counters of the end of the chain and of
+// the primary database.
+//
+// The counters are only read when the decision needs them: the chain and the
+// generation of the log have to be known.
+func (p *Peer) changeCounters() (primary, chain changeCounter, err error) {
+	value, err := p.drv.ChangeCounter()
+	if err != nil {
+		return changeCounter{}, changeCounter{}, err
+	}
+	return changeCounter{value: value, known: true}, chainChangeCounter(p.sp), nil
 }
 
 // setContinuityChecked remembers that the continuity of the chain was

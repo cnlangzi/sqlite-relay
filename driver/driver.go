@@ -142,6 +142,10 @@ type Driver struct {
 	seq           uint64
 	walHighWater  int64
 	lastReclaim   time.Time
+	// changeCounter is the change counter of the primary database.
+	changeCounter uint32
+	// changeCounterSet reports that the change counter is known.
+	changeCounterSet bool
 
 	// fenceMu serialises the observation of the backfill count with the
 	// checkpoints of the driver.
@@ -634,6 +638,7 @@ func (d *Driver) captureOnce(ctx context.Context) (Batch, bool, error) {
 	if err != nil {
 		return Batch{}, false, fmt.Errorf("driver: read WAL: %w", err)
 	}
+	d.noteChangeCounter(scan)
 	after, _, err := d.walFrames(ctx)
 	if err != nil {
 		return Batch{}, false, err

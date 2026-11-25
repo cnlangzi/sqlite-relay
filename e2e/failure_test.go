@@ -131,6 +131,51 @@ func TestTheRelayResumesAfterACrashOfThePrimary(t *testing.T) {
 	r.compare()
 }
 
+// TestTheRelayRebuildsTheChainWhenThePrimaryLostTransactions checks that the
+// relay rebuilds the chain when the primary database lost the transactions
+// the chain holds.
+//
+// The primary is killed and the tail of its write-ahead log is lost. The
+// generation of the log did not change: the chain does not cover the primary
+// database any more. The spool starts a new chain, the epoch is raised and
+// the backup gets a new baseline.
+func TestTheRelayRebuildsTheChainWhenThePrimaryLostTransactions(t *testing.T) {
+	r := newRelay(t)
+	// The log of the primary keeps its frames: the test truncates them.
+	r.writeSettings(settings{Retention: 3600, ReclaimInterval: 3600})
+	r.startPrimary()
+	r.createSchema()
+	r.insert(100)
+	r.startBackup()
+	r.waitCatchUp()
+
+	epoch := r.sourceStats().Spool.Epoch
+	snapshots := r.backupStats().Snapshots
+
+	// The primary dies: the write-ahead log survives.
+	if err := r.primary.crash(); err == nil {
+		t.Fatal("the primary was killed, want the error of the wait")
+	}
+	// The tail of the log is lost: the primary database lost the
+	// transactions that were committed at the end of the log.
+	if err := truncateWAL(t, r.walPath()); err != nil {
+		t.Fatalf("truncate the write-ahead log: %v", err)
+	}
+
+	r.startPrimary()
+	if !waitFor(catchUpTimeout, func() bool { return r.sourceStats().Spool.Epoch > epoch }) {
+		t.Errorf("the epoch of the chain did not change: %+v", r.sourceStats().Spool)
+	}
+	// The backup sees the new generation of the chain and asks for a new
+	// baseline.
+	if !waitFor(catchUpTimeout, func() bool { return r.backupStats().Snapshots > snapshots }) {
+		t.Errorf("the backup did not install a new baseline: %+v", r.backupStats())
+	}
+	r.insert(50)
+	r.waitCatchUp()
+	r.compare()
+}
+
 // TestTheRelayRecoversFromACrashOfTheBackup checks that the backup
 // continues after it died while it applied the increments.
 //
