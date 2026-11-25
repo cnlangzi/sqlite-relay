@@ -1142,13 +1142,17 @@ func waitFor(timeout time.Duration, cond func() bool) bool {
 // The condition has to hold for a moment: the capture of the source runs
 // after the commit of the business, a sample may be taken before the last
 // transaction reached the spool.
+//
+// The source holds the transactions that did not fit into the spool in its
+// memory: they are not durable and the backup does not have them yet. The
+// source reports the spool as full while it holds them.
 func (r *relay) waitCatchUp() {
 	r.t.Helper()
 	since := time.Time{}
 	if !waitFor(catchUpTimeout, func() bool {
 		src := r.sourceStats()
 		bck := r.backupStats()
-		if src.CapturedSeq != bck.AppliedSeq || src.BackupSeq != src.CapturedSeq {
+		if src.CapturedSeq != bck.AppliedSeq || src.BackupSeq != src.CapturedSeq || src.SpoolFull {
 			since = time.Time{}
 			return false
 		}
@@ -1160,8 +1164,8 @@ func (r *relay) waitCatchUp() {
 	}) {
 		src := r.sourceStats()
 		bck := r.backupStats()
-		r.t.Fatalf("the backup did not catch up: the source captured %d, the backup applied %d, the source holds the acknowledgement %d",
-			src.CapturedSeq, bck.AppliedSeq, src.BackupSeq)
+		r.t.Fatalf("the backup did not catch up: the source captured %d, the backup applied %d, the source holds the acknowledgement %d, the spool is full: %t",
+			src.CapturedSeq, bck.AppliedSeq, src.BackupSeq, src.SpoolFull)
 	}
 }
 
