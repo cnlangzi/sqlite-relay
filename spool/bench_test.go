@@ -116,3 +116,57 @@ func BenchmarkRecover(b *testing.B) {
 	b.StopTimer()
 	b.ReportMetric(float64(segments), "segments")
 }
+
+// spoolSyncPages is the number of the pages of the transaction the
+// benchmark of the syncs writes.
+const spoolSyncPages = 128
+
+// spoolSyncBatch is the number of the transactions the spool writes before it
+// runs the barrier of ModeNormal.
+const spoolSyncBatch = 32
+
+// BenchmarkTheSpoolSyncs measures the number of the fsyncs the spool runs per
+// megabyte it writes.
+//
+// The three modes of the spool have three barriers: the barrier of ModeOff is
+// the write of the operating system, the barrier of ModeNormal is a batch of
+// segments and the barrier of ModeFull is every segment on its own.
+func BenchmarkTheSpoolSyncs(b *testing.B) {
+	for _, mode := range []Mode{ModeOff, ModeNormal, ModeFull} {
+		b.Run(mode.String(), func(b *testing.B) {
+			s := benchSpool(b, mode)
+			counter := &syncCounter{}
+			counter.install(s)
+
+			ctx := context.Background()
+			tx := testTx(1, spoolSyncPages)
+			size := txSize(tx)
+			b.SetBytes(size)
+			b.ResetTimer()
+			for i := range b.N {
+				if err := s.Append(ctx, tx); err != nil {
+					b.Fatalf("Append: %v", err)
+				}
+				if err := s.Flush(ctx); err != nil {
+					b.Fatalf("Flush: %v", err)
+				}
+				if mode == ModeNormal && i%spoolSyncBatch == spoolSyncBatch-1 {
+					if err := s.Sync(ctx); err != nil {
+						b.Fatalf("Sync: %v", err)
+					}
+				}
+				if i%500 == 499 {
+					// The segments that pile up are of no interest to the
+					// measurement: only the number of their syncs counts.
+					b.StopTimer()
+					_ = s.removeFiles(s.segDir)
+					s.segs = nil
+					b.StartTimer()
+				}
+			}
+			b.StopTimer()
+			megabytes := float64(size) * float64(b.N) / (1 << 20)
+			b.ReportMetric(float64(counter.total())/megabytes, "fsync/MiB")
+		})
+	}
+}

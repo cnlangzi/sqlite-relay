@@ -146,7 +146,7 @@ type rows struct {
 // the two sides of the relay in it. A process is a re-execution of the test
 // binary: the role in the environment names the side it runs.
 type relay struct {
-	t   *testing.T
+	t   testing.TB
 	dir string
 	// listen is the address the primary listens on. The address survives
 	// the restart of the primary: a backup that is connected finds it
@@ -161,7 +161,10 @@ type relay struct {
 }
 
 // newRelay creates the work directory of a test.
-func newRelay(t *testing.T) *relay {
+//
+// The parameter is a testing.TB: the benchmarks of the package use the same
+// harness as the tests.
+func newRelay(t testing.TB) *relay {
 	t.Helper()
 	root := os.Getenv(envRoot)
 	if root == "" {
@@ -343,6 +346,52 @@ func (r *relay) segmentFiles() []string {
 	return out
 }
 
+// segmentBytesAfter returns the size of the segments of the chain that hold
+// a transaction after seq.
+//
+// The name of a segment holds the sequence numbers of its first and of its
+// last transaction.
+func (r *relay) segmentBytesAfter(seq uint64) (int64, int) {
+	r.t.Helper()
+	var bytes int64
+	var count int
+	for _, path := range r.segmentFiles() {
+		name := filepath.Base(path)
+		parts := strings.Split(strings.TrimSuffix(name, ".seg"), "-")
+		if len(parts) != 2 {
+			r.t.Fatalf("the segment %q does not hold the sequence numbers of its transactions", name)
+		}
+		end, err := strconv.ParseUint(parts[1], 10, 64)
+		if err != nil {
+			r.t.Fatalf("the segment %q does not hold the sequence number of its last transaction: %v", name, err)
+		}
+		if end <= seq {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			r.t.Fatalf("stat the segment %s: %v", path, err)
+		}
+		bytes += info.Size()
+		count++
+	}
+	return bytes, count
+}
+
+// waitForSeq waits until the source holds the given sequence number.
+//
+// The condition has to hold for a moment: the capture of the source runs
+// after the commit of the business, a sample may be taken before the last
+// transaction reached the spool.
+func (r *relay) waitForSeq(seq uint64) {
+	r.t.Helper()
+	if !waitFor(catchUpTimeout, func() bool {
+		return r.sourceStats().CapturedSeq >= seq
+	}) {
+		r.t.Fatalf("the source did not capture the sequence number %d, it holds %d", seq, r.sourceStats().CapturedSeq)
+	}
+}
+
 // do sends a command to a process and returns the payload of the answer.
 //
 // A command that failed is an error: the message of the failure holds the
@@ -376,7 +425,7 @@ func (c *child) do(format string, args ...any) (string, error) {
 
 // child is a process of the relay.
 type child struct {
-	t   *testing.T
+	t   testing.TB
 	cmd *exec.Cmd
 	in  io.WriteCloser
 	// out holds the answers of the process.
@@ -489,6 +538,24 @@ func (c *child) exitCode() int {
 		return -1
 	}
 	return c.cmd.ProcessState.ExitCode()
+}
+
+// rusage returns the resources the process used.
+//
+// The call is only valid after the process ended: the usage of a process is
+// known when it was waited for.
+func (c *child) rusage() syscall.Rusage {
+	c.t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cmd.ProcessState == nil {
+		c.t.Fatal("the process did not end yet")
+	}
+	usage, ok := c.cmd.ProcessState.SysUsage().(*syscall.Rusage)
+	if !ok {
+		c.t.Fatalf("the usage of the process is %T, want a rusage", c.cmd.ProcessState.SysUsage())
+	}
+	return *usage
 }
 
 // output returns the output of the process.
@@ -663,6 +730,17 @@ func (p *primary) handle(line string) string {
 		if err := p.insert(n, n); err != nil {
 			return fmt.Sprintf("err %v", err)
 		}
+	case "insert-rate":
+		nums, err := numbers(fields)
+		if err != nil {
+			return fmt.Sprintf("err %v", err)
+		}
+		if len(nums) != 2 {
+			return "err the command needs a number of rows and a rate"
+		}
+		if err := p.insertAtRate(nums[0], nums[1]); err != nil {
+			return fmt.Sprintf("err %v", err)
+		}
 	case "entries":
 		n, err := count(fields)
 		if err != nil {
@@ -735,6 +813,24 @@ func count(fields []string) (int, error) {
 	return strconv.Atoi(arg)
 }
 
+// numbers returns the numbers a command names.
+func numbers(fields []string) ([]int, error) {
+	arg, ok := argument(fields)
+	if !ok {
+		return nil, errors.New("the command needs numbers")
+	}
+	parts := strings.Fields(arg)
+	out := make([]int, 0, len(parts))
+	for _, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, fmt.Errorf("%q is not a number", p)
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
 // insert writes n rows into the accounts table.
 //
 // The rows are written in the given number of transactions: one transaction
@@ -756,17 +852,16 @@ func (p *primary) insert(n, perTx int) error {
 		if count > n-written {
 			count = n - written
 		}
-		first, err := nextAccountID(db)
-		if err != nil {
-			return err
-		}
 		if perTx == 1 {
-			if _, err := db.Exec("INSERT INTO accounts(id, name, balance) VALUES(?, ?, ?)",
-				first, accountName(first), first*100); err != nil {
+			if err := p.insertOne(); err != nil {
 				return err
 			}
 			written++
 			continue
+		}
+		first, err := nextAccountID(db)
+		if err != nil {
+			return err
 		}
 		tx, err := db.Begin()
 		if err != nil {
@@ -784,6 +879,49 @@ func (p *primary) insert(n, perTx int) error {
 			return err
 		}
 		written += count
+	}
+	return nil
+}
+
+// insertAtRate writes n rows into the accounts table at a fixed rate.
+//
+// Every row is written in a transaction of its own and every row waits for
+// the time its turn comes: the load has the rate it asks for and not the rate
+// the disk reaches. A row that takes longer than its turn delays the rows
+// that follow it.
+func (p *primary) insertAtRate(n, rate int) error {
+	if rate <= 0 {
+		rate = 1
+	}
+	interval := time.Second / time.Duration(rate)
+	start := time.Now()
+	for i := range n {
+		if i > 0 {
+			time.Sleep(time.Until(start.Add(time.Duration(i) * interval)))
+		}
+		if err := p.insertOne(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// insertOne writes a single row into the accounts table.
+//
+// The id of the row follows the rows that are already there, so that a
+// primary that was restarted does not write an id twice. The id is read
+// before the transaction is opened: a transaction that reads first holds a
+// snapshot of the log, and a snapshot may not be written any more when the
+// log was reset in the meantime.
+func (p *primary) insertOne() error {
+	db := p.drv.DB()
+	first, err := nextAccountID(db)
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec("INSERT INTO accounts(id, name, balance) VALUES(?, ?, ?)",
+		first, accountName(first), first*100); err != nil {
+		return err
 	}
 	return nil
 }
