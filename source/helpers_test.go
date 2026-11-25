@@ -38,6 +38,23 @@ func newTestDriver(t *testing.T, dir string) (*driver.Driver, string) {
 	return d, path
 }
 
+// reopenTestDriver opens a driver on the database of the tests again.
+//
+// The write-ahead log of the database is reset when the last connection of
+// the database closes: the driver that opens it sees a new generation.
+func reopenTestDriver(t *testing.T, path string) *driver.Driver {
+	t.Helper()
+	d, err := driver.Open(context.Background(), driver.Config{
+		DSN:          path + "?_journal_mode=WAL",
+		ScanInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("open the driver: %v", err)
+	}
+	t.Cleanup(func() { d.Close() })
+	return d
+}
+
 // testConfig returns the configuration of the runtime of the tests.
 func testConfig(t *testing.T, dir string) Config {
 	t.Helper()
