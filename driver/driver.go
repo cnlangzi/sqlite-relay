@@ -627,6 +627,11 @@ func (d *Driver) captureOnce(ctx context.Context) (Batch, bool, error) {
 	// driver compares with, so a reader with a stale header is replaced
 	// before the cursor is moved.
 	reader, hdr, err := d.currentReader(reader)
+	if errors.Is(err, wal.ErrNoWAL) {
+		// The WAL is gone. SQLite removes it when the last connection
+		// closes the database, so there is nothing left to capture.
+		return Batch{}, false, nil
+	}
 	if err != nil {
 		return Batch{}, false, err
 	}
@@ -717,17 +722,15 @@ func (d *Driver) batchOf(scan *wal.Scan, from Position) Batch {
 // The reader holds the header of the generation it opened. SQLite resets the
 // WAL while the driver holds it: the reader is replaced by one that holds the
 // generation of the log on the disk.
+//
+// The error is wal.ErrNoWAL when the log is gone: SQLite removes it when the
+// last connection of the database closes.
 func (d *Driver) currentReader(reader *wal.Reader) (*wal.Reader, wal.Header, error) {
 	hdr := reader.Header()
 	onDisk, err := wal.ReadHeader(d.walPath)
-	if errors.Is(err, wal.ErrNoWAL) {
-		// The WAL is gone. SQLite removes it when the last connection
-		// closes the database, so there is nothing left to capture.
-		d.resetReader()
-		return reader, hdr, nil
-	}
 	if err != nil {
-		return reader, hdr, err
+		d.resetReader()
+		return nil, hdr, err
 	}
 	if onDisk.Salt1 == hdr.Salt1 && onDisk.Salt2 == hdr.Salt2 {
 		return reader, hdr, nil
@@ -737,10 +740,7 @@ func (d *Driver) currentReader(reader *wal.Reader) (*wal.Reader, wal.Header, err
 	d.resetReader()
 	reader, err = d.walReader()
 	if err != nil {
-		if errors.Is(err, wal.ErrNoWAL) {
-			return reader, hdr, nil
-		}
-		return reader, hdr, err
+		return nil, hdr, err
 	}
 	return reader, reader.Header(), nil
 }
