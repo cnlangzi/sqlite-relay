@@ -438,15 +438,20 @@ The directory `examples/relay` holds a program that shows how an application
 uses the relay. It opens a primary database, it attaches the source runtime
 to it, it connects a backup to the runtime, it writes rows, it waits for the
 backup to catch up, it pauses the backup, it reads the database of the backup
-while it is paused and it resumes the backup.
+while it is paused, it resumes the backup and it waits for the backup to catch
+up again.
 
 ```
 go run ./examples/relay
 ```
 
+The business reads the database of the backup only while the backup is
+paused: the relay writes the file of the backup itself while the backup is in
+sync.
+
 The program works in a temporary directory and removes it when it ends. The
-flag `-dir` names a work directory that is kept, the flag `-addr` names the
-address the primary listens on.
+flag `-dir` names a work directory that is kept and that has to be empty, the
+flag `-addr` names the address the primary listens on.
 
 ```
 go run ./examples/relay -dir /tmp/relay

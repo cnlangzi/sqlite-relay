@@ -11,7 +11,9 @@
 //
 // The work directory is a temporary directory unless the flag -dir names one.
 // A work directory that the caller names is kept, a temporary one is removed
-// when the program ends.
+// when the program ends. A work directory that the caller names has to be
+// empty: the program writes the database of the relay into it and it cannot
+// run twice in the same directory.
 package main
 
 import (
@@ -77,7 +79,7 @@ func main() {
 
 // run runs the whole life of a relay.
 func run() error {
-	dir := flag.String("dir", "", "the work directory of the relay, a temporary directory by default")
+	dir := flag.String("dir", "", "the work directory of the relay, a temporary directory by default, an empty one")
 	addr := flag.String("addr", "127.0.0.1:0", "the address the primary listens on")
 	flag.Parse()
 
@@ -134,7 +136,11 @@ func run() error {
 		return fmt.Errorf("listen on %s: %w", *addr, err)
 	}
 	defer func() { _ = ln.Close() }()
-	go func() { _ = peer.Run(ctx, ln) }()
+
+	// The errors of the two sides of the relay: a side that ends tells why
+	// it ended.
+	runErr := make(chan error, 2)
+	go func() { runErr <- peer.Run(ctx, ln) }()
 
 	// The backup side of the relay. It has no baseline when it connects:
 	// it asks the source for a snapshot of the primary database.
@@ -150,14 +156,14 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("open the backup: %w", err)
 	}
-	go func() { _ = bpeer.Run(ctx, ln.Addr().String()) }()
+	go func() { runErr <- bpeer.Run(ctx, ln.Addr().String()) }()
 
 	// The business writes. The relay does not hold the transaction up: it
 	// captures the increment in the background.
-	if err := insert(drv.DB(), firstRows); err != nil {
+	if err := insert(drv.DB(), firstRows, 0); err != nil {
 		return err
 	}
-	if err := waitForCatchUp(peer, bpeer, schemaSeq+firstRows); err != nil {
+	if err := waitForCatchUp(peer, bpeer, schemaSeq+firstRows, runErr); err != nil {
 		return err
 	}
 	fmt.Println("the backup caught up with the primary")
@@ -179,7 +185,7 @@ func run() error {
 
 	// The business writes while the backup is paused. The backup does not
 	// touch its database in that time.
-	if err := insert(drv.DB(), secondRows); err != nil {
+	if err := insert(drv.DB(), secondRows, firstRows); err != nil {
 		return err
 	}
 	backupRows, err = countBackupRows(root)
@@ -193,8 +199,16 @@ func run() error {
 	if err := bpeer.Resume(ctx); err != nil && !errors.Is(err, backup.ErrSnapshotRequired) {
 		return fmt.Errorf("resume the backup: %w", err)
 	}
-	if err := waitForCatchUp(peer, bpeer, schemaSeq+firstRows+secondRows); err != nil {
+	if err := waitForCatchUp(peer, bpeer, schemaSeq+firstRows+secondRows, runErr); err != nil {
 		return err
+	}
+	fmt.Println("the backup caught up with the primary again")
+
+	// The relay writes the database of the backup itself while the backup
+	// is in sync: the business reads the copy of the database while the
+	// backup is paused.
+	if err := bpeer.Pause(ctx); err != nil {
+		return fmt.Errorf("pause the backup: %w", err)
 	}
 	primaryRows, err = countRows(drv.DB())
 	if err != nil {
@@ -228,11 +242,15 @@ func workDir(dir string) (string, func(), error) {
 }
 
 // insert writes n rows into the accounts table.
-func insert(db *sql.DB, n int) error {
+//
+// The names of the rows start at first: two batches of the business do not
+// share a name.
+func insert(db *sql.DB, n, first int) error {
 	for i := range n {
+		id := first + i
 		if _, err := db.Exec("INSERT INTO accounts(name, balance) VALUES(?, ?)",
-			fmt.Sprintf("account-%d", i), i*100); err != nil {
-			return fmt.Errorf("write the row %d: %w", i, err)
+			fmt.Sprintf("account-%d", id), id*100); err != nil {
+			return fmt.Errorf("write the row %d: %w", id, err)
 		}
 	}
 	return nil
@@ -267,10 +285,21 @@ func countBackupRows(root string) (int, error) {
 // The condition has to hold for a moment: the capture of the source runs
 // after the commit of the business and a sample may be taken before the last
 // transaction reached the spool.
-func waitForCatchUp(peer *source.Peer, bpeer *backup.Peer, seq uint64) error {
+//
+// A side of the relay that ends ends the wait: the error it reports is the
+// reason the backup does not catch up.
+func waitForCatchUp(peer *source.Peer, bpeer *backup.Peer, seq uint64, runErr <-chan error) error {
 	deadline := time.Now().Add(catchUpTimeout)
 	var since time.Time
 	for {
+		select {
+		case err := <-runErr:
+			if err == nil {
+				return errors.New("a side of the relay ended")
+			}
+			return fmt.Errorf("a side of the relay ended: %w", err)
+		default:
+		}
 		captured := peer.Stats().CapturedSeq
 		applied := bpeer.Stats().AppliedSeq
 		if captured >= seq && applied >= captured {
