@@ -1215,17 +1215,40 @@ func (r *relay) queryBackup(query string) rows {
 // database and on the database of the backup and the rows are compared one
 // by one. The bytes of the two files are not the same: the backup rewrites
 // the header of the first page.
+//
+// A mismatch reports the state of the relay: the sequence numbers of the two
+// sides and the epoch of the chain say where the chain stopped.
 func (r *relay) compare() {
 	r.t.Helper()
 	for _, query := range []string{queryAccounts, queryEntries, querySchema} {
 		want := r.queryPrimary(query)
 		got := r.queryBackup(query)
 		if !reflect.DeepEqual(want, got) {
-			r.t.Errorf("the backup does not hold the rows of the primary database for the query %q:\nprimary: %v\nbackup:  %v",
-				query, want.Rows, got.Rows)
+			r.t.Errorf("the backup does not hold the rows of the primary database for the query %q:\nprimary: %v\nbackup:  %v\nstate:%s",
+				query, want.Rows, got.Rows, r.state())
 		}
 	}
 	r.checkIntegrity()
+}
+
+// state returns the statistics of the two sides of the relay.
+//
+// The state is best effort: a process that is gone has no statistics.
+func (r *relay) state() string {
+	var b strings.Builder
+	b.WriteString("\n  source: ")
+	if out, err := r.primary.do("stats"); err == nil {
+		b.WriteString(out)
+	} else {
+		b.WriteString(err.Error())
+	}
+	b.WriteString("\n  backup: ")
+	if out, err := r.backup.do("stats"); err == nil {
+		b.WriteString(out)
+	} else {
+		b.WriteString(err.Error())
+	}
+	return b.String()
 }
 
 // checkIntegrity checks the database of the backup.
