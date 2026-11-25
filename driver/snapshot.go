@@ -22,6 +22,10 @@ type Snapshot struct {
 	Bytes int64
 	// Pos is the capture position the snapshot is bound to. The increments
 	// that follow this position bring the database up to date.
+	//
+	// The snapshot of a database whose write-ahead log holds no frame is
+	// bound to the position the consumer acknowledged: the log holds no
+	// frame, the position names the last frame that is in the file.
 	Pos Position
 }
 
@@ -121,19 +125,8 @@ func (d *Driver) snapshotOnce(ctx context.Context, dst string) (*Snapshot, error
 
 	// Copy the database file and make sure it did not move while it was
 	// copied.
-	before, err := readBaseline(d.dbPath)
-	if err != nil {
+	if err := d.copyVerifiedFile(dst); err != nil {
 		return nil, err
-	}
-	if err := copyFile(d.dbPath, dst); err != nil {
-		return nil, err
-	}
-	after, err := readBaseline(d.dbPath)
-	if err != nil {
-		return nil, err
-	}
-	if before != after {
-		return nil, fmt.Errorf("driver: the database file changed while it was copied")
 	}
 
 	// Overlay the pages of the WAL and cut the file to the size the
@@ -179,19 +172,8 @@ func (d *Driver) snapshotOnce(ctx context.Context, dst string) (*Snapshot, error
 // database file. The boundary of the snapshot is the position the consumer
 // acknowledged: the frames up to it were written back into the file.
 func (d *Driver) snapshotOfFile(dst string) (*Snapshot, error) {
-	before, err := readBaseline(d.dbPath)
-	if err != nil {
+	if err := d.copyVerifiedFile(dst); err != nil {
 		return nil, err
-	}
-	if err := copyFile(d.dbPath, dst); err != nil {
-		return nil, err
-	}
-	after, err := readBaseline(d.dbPath)
-	if err != nil {
-		return nil, err
-	}
-	if before != after {
-		return nil, fmt.Errorf("driver: the database file changed while it was copied")
 	}
 	if err := checkIntegrity(dst); err != nil {
 		return nil, err
@@ -201,6 +183,28 @@ func (d *Driver) snapshotOfFile(dst string) (*Snapshot, error) {
 		return nil, err
 	}
 	return &Snapshot{Path: dst, Bytes: info.Size(), Pos: d.ackPosition()}, nil
+}
+
+// copyVerifiedFile copies the database file to dst.
+//
+// The copy has to be a file that did not move while it was copied: a
+// database that was written in the meantime is torn.
+func (d *Driver) copyVerifiedFile(dst string) error {
+	before, err := readBaseline(d.dbPath)
+	if err != nil {
+		return err
+	}
+	if err := copyFile(d.dbPath, dst); err != nil {
+		return err
+	}
+	after, err := readBaseline(d.dbPath)
+	if err != nil {
+		return err
+	}
+	if before != after {
+		return fmt.Errorf("driver: the database file changed while it was copied")
+	}
+	return nil
 }
 
 // pauseCheckpoints stops the checkpoint manager until the returned function

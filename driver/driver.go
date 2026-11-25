@@ -790,9 +790,6 @@ func (d *Driver) cursorPosition() Position {
 func (d *Driver) ackPosition() Position {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if !d.ackSet {
-		return Position{}
-	}
 	return d.ack
 }
 
