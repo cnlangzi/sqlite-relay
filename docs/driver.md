@@ -110,6 +110,11 @@ frames that are gone are lost and the consumer needs a new baseline. The
 frames that the WAL held before the driver started do not count: the
 consumer holds the increments it has seen already.
 
+The driver reports the loss once and it continues in the new generation: it
+captures the frames of the new generation from its first frame. The consumer
+rebuilds its chain and takes a new baseline, the frames of the new generation
+follow that baseline.
+
 ### The change counter
 
 `ChangeCounter` returns the change counter of the primary database. The
