@@ -157,9 +157,6 @@ type Driver struct {
 	// scanCompensations counts the capture rounds that returned
 	// transactions that no notification announced.
 	scanCompensations atomic.Uint64
-	// notified reports that a notification was delivered since the last
-	// capture round.
-	notified atomic.Bool
 
 	// eventsMu guards the channel of the notifications.
 	eventsMu     sync.Mutex
@@ -168,6 +165,12 @@ type Driver struct {
 	// captureMu serializes the capture rounds.
 	captureMu sync.Mutex
 	reader    *wal.Reader
+	// deliveredSeen is the number of the notifications that were delivered
+	// when the last capture round ended.
+	deliveredSeen uint64
+	// swallowedSeen is the number of the notifications that were swallowed
+	// when the last capture round ended.
+	swallowedSeen uint64
 
 	// ckptMu guards the checkpoint manager.
 	ckptMu     sync.Mutex
@@ -638,9 +641,19 @@ func (d *Driver) capture(ctx context.Context) (Batch, error) {
 // The periodic scan of the driver backs the notifications of the WAL hook
 // up. A round that found transactions without a notification found them on
 // its own.
+//
+// The counters of the notifications are read at the end of the round and
+// compared with the counters of the round before it. A notification that
+// the driver counted after the round ended belongs to the round that finds
+// the commit it announced.
 func (d *Driver) noteScanCompensation(batch Batch) {
-	notified := d.notified.Swap(false)
-	if len(batch.Changes) == 0 || notified {
+	delivered := d.notifications.Load()
+	swallowed := d.droppedNotifications.Load()
+	covered := delivered != d.deliveredSeen
+	lost := swallowed != d.swallowedSeen
+	d.deliveredSeen = delivered
+	d.swallowedSeen = swallowed
+	if len(batch.Changes) == 0 || (covered && !lost) {
 		return
 	}
 	d.scanCompensations.Add(1)

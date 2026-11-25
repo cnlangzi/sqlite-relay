@@ -68,8 +68,9 @@ type Stats struct {
 	// CommitFrames is the number of frames of the current WAL generation
 	// that are committed: the boundary of the last complete transaction in
 	// the log. The driver reads the boundary out of the WAL bytes while it
-	// captures, WALFrames is the number of frames SQLite reports for the
-	// same generation.
+	// captures, so the value is the boundary of the last capture round.
+	// WALFrames is the number of frames SQLite reports for the same
+	// generation at the moment the statistics are taken.
 	CommitFrames uint64
 	// WALBytes is the size of the WAL file.
 	WALBytes int64

@@ -42,7 +42,6 @@ func (d *Driver) announce(n Notification) {
 	select {
 	case d.events <- n:
 		d.notifications.Add(1)
-		d.notified.Store(true)
 	default:
 		d.droppedNotifications.Add(1)
 	}
