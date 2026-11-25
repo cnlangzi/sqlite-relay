@@ -217,6 +217,9 @@ func TestTheRelayRecoversFromACrashOfTheBackup(t *testing.T) {
 // of skipping the increments silently.
 func TestTheBackupAsksForANewBaselineWhenTheHistoryIsGone(t *testing.T) {
 	r := newRelay(t)
+	// The segments are small: the chain of the source holds more than one
+	// segment whatever the rounds of the capture are.
+	r.writeSettings(settings{SegmentMaxBytes: 64 << 10})
 	r.startPrimary()
 
 	// The backup takes its baseline before the primary writes: the history
