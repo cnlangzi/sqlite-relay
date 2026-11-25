@@ -20,18 +20,20 @@ tests: ## Run the tests with the race detector (PKGS=./driver/... to scope them)
 	$(GO) test -race $(PKGS)
 
 e2e: ## Run the end-to-end tests of the relay (E2E_PKGS to scope them)
-	$(GO) test -race -tags e2e $(E2E_PKGS)
+	$(GO) test -race -timeout 25m -tags e2e $(E2E_PKGS)
 
 bench: ## Run the benchmarks
 	$(GO) test -bench . -benchmem -run '^$$' -tags e2e $(PKGS)
 
 vet: ## Run go vet
-	$(GO) vet $(PKGS)
+	$(GO) vet -tags e2e $(PKGS)
 
 lint: fmt-check ## Check formatting and run golangci-lint
 	@command -v golangci-lint >/dev/null || { echo "golangci-lint not found, run 'make tools'"; exit 1; }
 	@pinned=$$($(GO) env GOPATH)/bin/golangci-lint; \
-	if [ -x "$$pinned" ]; then "$$pinned" run --build-tags=e2e $(PKGS); else golangci-lint run --build-tags=e2e $(PKGS); fi
+	if [ -x "$$pinned" ]; then linter="$$pinned"; else linter=golangci-lint; fi; \
+	"$$linter" run --build-tags=e2e $(PKGS); \
+	"$$linter" run --build-tags=e2e --tests=true $(E2E_PKGS)
 
 fmt: ## Format every file
 	gofmt -w .

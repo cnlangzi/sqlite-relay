@@ -8,4 +8,9 @@
 // a file system that honors fsync, so they run in their own target:
 //
 //	make e2e
+//
+// The work directories are created in the directory of the environment
+// variable SQLITE_RELAY_E2E_ROOT and in the temporary directory of the
+// operating system when the variable is not set. A tmpfs does not honor
+// fsync: the persistence barriers of the relay are not told apart on it.
 package e2e

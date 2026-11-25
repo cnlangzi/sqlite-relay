@@ -36,8 +36,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # The tests need a file system that honors fsync: a tmpfs would not
-      # tell the persistence barriers apart.
+      # The work directories of the tests are created in the checkout: the
+      # tests leave nothing in the temporary directory of the runner.
       SQLITE_RELAY_E2E_ROOT: ${{ github.workspace }}/.e2e-root
     steps:
       - uses: actions/checkout@v7
