@@ -117,19 +117,20 @@ func TestTheRelayKeepsThePrimaryWritableWhileTheBackupIsAway(t *testing.T) {
 		t.Errorf("the 1000 commits took %s, want less than 30s", elapsed)
 	}
 
-	st := r.sourceStats()
-	if st.Spool.UnackedSegments == 0 {
-		t.Error("the spool holds no segment the backup did not acknowledge")
+	// The capture runs after the commits: the statistics are polled until
+	// the runtime caught up.
+	if !waitFor(catchUpTimeout, func() bool { return r.sourceStats().LagSeq > 0 }) {
+		t.Errorf("the source lags %d transactions, want a lag while the backup is away", r.sourceStats().LagSeq)
 	}
-	if st.LagSeq == 0 {
-		t.Errorf("the source lags %d transactions, want a lag while the backup is away", st.LagSeq)
+	if !waitFor(catchUpTimeout, func() bool { return r.sourceStats().Spool.UnackedSegments > 0 }) {
+		t.Error("the spool holds no segment the backup did not acknowledge")
 	}
 	// The increments are durable in the spool: the driver writes the frames
 	// of the log back.
 	if !waitFor(catchUpTimeout, func() bool { return r.sourceStats().Driver.Checkpoint.Checkpointed > 0 }) {
 		t.Errorf("the driver did not write a frame back: %+v", r.sourceStats().Driver.Checkpoint)
 	}
-	if st.Driver.AckPosition.Frame == 0 {
+	if !waitFor(catchUpTimeout, func() bool { return r.sourceStats().Driver.AckPosition.Frame > 0 }) {
 		t.Error("the driver holds no acknowledged position")
 	}
 
@@ -193,6 +194,11 @@ func TestTheWALIsReclaimedOnlyAfterTheSpoolIsDurable(t *testing.T) {
 //
 // The backup holds the increments in the local spool: the log does not have
 // to keep the frames that the spool holds already.
+//
+// The size of the file of the log is not the measure: SQLite does not
+// shrink the file, it writes the frames back into the database file and
+// reuses the space of the log. The frames the log holds are the measure:
+// the log starts over when the driver gave the space back.
 func TestTheWALStaysBoundedWhileTheBackupIsPaused(t *testing.T) {
 	r := newRelay(t)
 	r.startPrimary()
@@ -204,14 +210,25 @@ func TestTheWALStaysBoundedWhileTheBackupIsPaused(t *testing.T) {
 		t.Fatalf("the pause: %v", err)
 	}
 
-	// The driver gives the space of the log back above one megabyte: the
-	// log may not grow beyond four of them.
-	const limit = 4 << 20
+	var reclaimed bool
+	var dropped int
+	frames := r.sourceStats().Driver.WALFrames
 	for range 40 {
 		r.insert(50)
-		if size := r.walSize(); size > limit {
-			t.Fatalf("the write-ahead log holds %d bytes, want at most %d", size, limit)
+		st := r.sourceStats()
+		if st.Driver.Reclaim.Done {
+			reclaimed = true
 		}
+		if st.Driver.WALFrames < frames {
+			dropped += frames - st.Driver.WALFrames
+		}
+		frames = st.Driver.WALFrames
+	}
+	if !reclaimed {
+		t.Error("the driver did not give the space of the log back")
+	}
+	if dropped == 0 {
+		t.Errorf("the log was not recycled: it holds %d frames", frames)
 	}
 }
 
@@ -321,18 +338,16 @@ func TestTheStatusReportsTheStateOfTheRelay(t *testing.T) {
 		r.createSchema()
 		r.insert(100)
 
-		st := r.sourceStats()
-		if st.LagSeq == 0 {
-			t.Errorf("the source lags %d transactions, want a lag while the backup is away", st.LagSeq)
+		if !waitFor(catchUpTimeout, func() bool { return r.sourceStats().LagSeq > 0 }) {
+			t.Errorf("the source lags %d transactions, want a lag while the backup is away", r.sourceStats().LagSeq)
 		}
-		if st.Spool.UnackedSegments == 0 {
+		if !waitFor(catchUpTimeout, func() bool { return r.sourceStats().Spool.UnackedSegments > 0 }) {
 			t.Error("the spool holds no segment the backup did not acknowledge")
 		}
 
 		r.startBackup()
 		r.waitCatchUp()
-		st = r.sourceStats()
-		if st.LagSeq != 0 {
+		if st := r.sourceStats(); st.LagSeq != 0 {
 			t.Errorf("the source lags %d transactions, want no lag", st.LagSeq)
 		}
 

@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 30
     env:
       # The work directories of the tests are created in the checkout: the
-      # tests leave nothing in the temporary directory of the runner.
+      # checkout ignores them and the tests remove them when they are over.
       SQLITE_RELAY_E2E_ROOT: ${{ github.workspace }}/.e2e-root
     steps:
       - uses: actions/checkout@v7

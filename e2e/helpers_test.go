@@ -318,21 +318,6 @@ func (r *relay) walPath() string {
 	return r.primaryDBPath() + "-wal"
 }
 
-// walSize returns the size of the write-ahead log of the primary database.
-//
-// A log that does not exist has the size zero.
-func (r *relay) walSize() int64 {
-	r.t.Helper()
-	info, err := os.Stat(r.walPath())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0
-		}
-		r.t.Fatalf("stat the write-ahead log: %v", err)
-	}
-	return info.Size()
-}
-
 // backupDBPath returns the path of the database of the backup.
 func (r *relay) backupDBPath() string {
 	return filepath.Join(r.dir, "backups", databaseID, "backup.db")
@@ -699,7 +684,16 @@ func (p *primary) handle(line string) string {
 			return fmt.Sprintf("err %v", err)
 		}
 	case "vacuum":
-		if _, err := p.drv.DB().Exec("VACUUM"); err != nil {
+		// The driver reads the log while the database is vacuumed: the
+		// vacuum waits for the readers of the database.
+		var err error
+		for range 20 {
+			if _, err = p.drv.DB().Exec("VACUUM"); err == nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if err != nil {
 			return fmt.Sprintf("err %v", err)
 		}
 	case "query":
