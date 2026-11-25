@@ -95,6 +95,8 @@ agent believes it is done.
 
 - `make tests` — every package in the module, with the race detector.
 - `make tests PKGS=./driver/...` — only the packages a change touches.
+- `make e2e` — the end-to-end tests of the `e2e` package, with the build
+  tag `e2e` and the race detector.
 - `make lint` — formatting and golangci-lint; run `make tools` first
   when the linter is not installed.
 

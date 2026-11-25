@@ -253,6 +253,47 @@ runtime judges the chain when it starts, see
 | `SnapshotReason` | why the chain is broken |
 | `LastError` | the description of the last failure |
 
+## Benchmarks
+
+### Method
+
+The benchmark commits one transaction per iteration into a table with two
+columns. The three configurations are the primary database alone, the primary
+database with the source runtime and the primary database with the source
+runtime and a backup that applies the increments of the chain.
+
+```
+go test -bench . -benchmem -run '^$' -tags e2e ./e2e/
+```
+
+Measured on Linux/amd64 with an Intel Core i5-2410M CPU at 2.30 GHz, Go
+1.27.3 and SQLite 3.54.1. The machine was busy while the numbers were taken,
+so they are an upper bound.
+
+### Results
+
+| Benchmark | ns/op | WAL bytes | WAL frames |
+|---|---|---|---|
+| `BenchmarkTheRelayUnderLoad/no-relay` | 42388 | 634859072 | 154092 |
+| `BenchmarkTheRelayUnderLoad/relay-without-backup` | 46411 | 468509952 | 113716 |
+| `BenchmarkTheRelayUnderLoad/relay-with-backup` | 73611 | 432834872 | 105057 |
+
+The source runtime costs four microseconds on the commit of the business:
+the WAL hook of the driver hands the notification to the capture and
+returns. The business does not wait for the capture, for the spool or for
+the network.
+
+The backup adds 27 microseconds to the commit of the business on this
+machine. The backup applies the increments of the chain in the same process
+and the pages it writes compete with the writes of the business for the
+disk.
+
+The write-ahead log of the primary database grows with the number of the
+commits in every configuration: SQLite does not shrink the log, it writes
+the frames back into the database file and reuses the space of the log. The
+source runtime keeps the content of the log smaller: it acknowledges the
+frames it captured, the driver writes them back and the log starts over.
+
 ## Not supported
 
 ### A primary database that is written by somebody else

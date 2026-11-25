@@ -31,3 +31,17 @@ jobs:
         with:
           go-version-file: go.mod
       - run: make tests
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The tests need a file system that honors fsync: a tmpfs would not
+      # tell the persistence barriers apart.
+      SQLITE_RELAY_E2E_ROOT: ${{ github.workspace }}/.e2e-root
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: make e2e
