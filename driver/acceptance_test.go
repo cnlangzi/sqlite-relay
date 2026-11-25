@@ -189,6 +189,40 @@ func TestCheckpointDoesNotBlockTheWrites(t *testing.T) {
 	}
 }
 
+// TestTheSnapshotOfADatabaseWithoutAWriteAheadLog checks that a snapshot
+// works when the write-ahead log holds no frame.
+//
+// The log holds no frame when the database was not written to yet: the
+// database file holds every change that was committed and the snapshot is
+// the file alone.
+func TestTheSnapshotOfADatabaseWithoutAWriteAheadLog(t *testing.T) {
+	d, _ := newTestDriver(t, Config{})
+	ctx := context.Background()
+
+	snapPath := filepath.Join(t.TempDir(), "snapshot.db")
+	snap, err := d.Snapshot(ctx, snapPath)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snap.Bytes == 0 {
+		t.Error("the snapshot holds no bytes")
+	}
+	if err := checkIntegrity(snapPath); err != nil {
+		t.Errorf("the snapshot is not a valid database: %v", err)
+	}
+
+	// The capture continues after the snapshot.
+	createTable(t, d)
+	insert(t, d, "a")
+	batch, err := d.Scan(ctx)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(batch.Changes) == 0 {
+		t.Error("the increments after the snapshot were lost")
+	}
+}
+
 // TestSnapshotMatchesThePrimaryPageByPage checks that the snapshot and the
 // increments that follow it bring the database to the state of the primary,
 // page by page.

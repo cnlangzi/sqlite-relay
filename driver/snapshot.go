@@ -71,7 +71,12 @@ func (d *Driver) snapshotOnce(ctx context.Context, dst string) (*Snapshot, error
 	// where the backfill stands.
 	reader, err := wal.Open(d.walPath)
 	if err != nil {
-		return nil, fmt.Errorf("driver: open WAL: %w", err)
+		if !errors.Is(err, wal.ErrNoWAL) {
+			return nil, fmt.Errorf("driver: open WAL: %w", err)
+		}
+		// The log holds no frame: the database file holds every change
+		// that was committed. The snapshot is the file alone.
+		return d.snapshotOfFile(dst)
 	}
 	defer func() { _ = reader.Close() }()
 	scan, err := reader.Scan()
@@ -166,6 +171,36 @@ func (d *Driver) snapshotOnce(ctx context.Context, dst string) (*Snapshot, error
 	d.setWALBoundary(boundary)
 
 	return &Snapshot{Path: dst, Bytes: info.Size(), Pos: pos}, nil
+}
+
+// snapshotOfFile takes a snapshot of the database file alone.
+//
+// The write-ahead log holds no frame: every committed change is in the
+// database file. The boundary of the snapshot is the position the consumer
+// acknowledged: the frames up to it were written back into the file.
+func (d *Driver) snapshotOfFile(dst string) (*Snapshot, error) {
+	before, err := readBaseline(d.dbPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := copyFile(d.dbPath, dst); err != nil {
+		return nil, err
+	}
+	after, err := readBaseline(d.dbPath)
+	if err != nil {
+		return nil, err
+	}
+	if before != after {
+		return nil, fmt.Errorf("driver: the database file changed while it was copied")
+	}
+	if err := checkIntegrity(dst); err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		return nil, err
+	}
+	return &Snapshot{Path: dst, Bytes: info.Size(), Pos: d.ackPosition()}, nil
 }
 
 // pauseCheckpoints stops the checkpoint manager until the returned function
