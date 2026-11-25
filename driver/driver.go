@@ -730,14 +730,20 @@ func (d *Driver) handleGenerationChange(hdr wal.Header) error {
 	// Only the frames that the driver had a chance to capture are lost
 	// when the log is reset.
 	lost := d.walBoundary - max(d.cursor.Frame, d.startFrames)
-	if lost > 0 {
-		return fmt.Errorf("%w: the WAL was reset with %d of %d frames uncaptured", ErrSnapshotRequired, lost, d.walBoundary)
-	}
+	boundary := d.walBoundary
+	// The cursor moves to the new generation even when the frames are
+	// lost. The consumer needs a new baseline and the driver captures the
+	// frames of the new generation. A cursor that stays in the old
+	// generation reports the same loss in every round and the consumer
+	// rebuilds its chain over and over.
 	d.cursor = Position{Salt1: hdr.Salt1, Salt2: hdr.Salt2, Frame: 0, WALOffset: walOffset(0, d.pageSize)}
 	d.cursorSet = true
 	d.walBoundary = 0
 	d.startFrames = 0
 	d.clearAck()
+	if lost > 0 {
+		return fmt.Errorf("%w: the WAL was reset with %d of %d frames uncaptured", ErrSnapshotRequired, lost, boundary)
+	}
 	return nil
 }
 

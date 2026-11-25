@@ -203,21 +203,7 @@ func TestResetOfTheWALWithUncapturedFramesIsReported(t *testing.T) {
 
 	// A transaction that the driver observes but does not capture.
 	insert(t, d, "b")
-
-	deadline := time.Now().Add(5 * time.Second)
-	boundary := uint64(0)
-	for time.Now().Before(deadline) {
-		d.mu.Lock()
-		boundary = d.walBoundary
-		d.mu.Unlock()
-		if boundary > d.cursorPosition().Frame {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if boundary <= d.cursorPosition().Frame {
-		t.Fatal("the driver did not observe the frame count of the WAL")
-	}
+	waitForWALBoundary(t, d)
 
 	err := d.handleGenerationChange(wal.Header{Salt1: 1, Salt2: 2})
 	if err == nil {
@@ -229,6 +215,52 @@ func TestResetOfTheWALWithUncapturedFramesIsReported(t *testing.T) {
 	if !contains(err.Error(), "snapshot") {
 		t.Fatalf("the error does not ask for a new snapshot: %v", err)
 	}
+}
+
+// TestTheResetOfTheWALIsNotReportedTwice checks that the driver does not
+// report the same loss of frames in every round.
+//
+// The consumer needs a new baseline and rebuilds its chain. The driver
+// captures the frames of the new generation: a cursor that stays in the old
+// generation reports the loss again and the consumer rebuilds its chain over
+// and over.
+func TestTheResetOfTheWALIsNotReportedTwice(t *testing.T) {
+	d, _ := newTestDriver(t, Config{ScanInterval: 10 * time.Millisecond})
+	createTable(t, d)
+	insert(t, d, "a")
+	scanAll(t, d)
+
+	// A transaction that the driver observes but does not capture.
+	insert(t, d, "b")
+	waitForWALBoundary(t, d)
+
+	hdr := wal.Header{Salt1: 1, Salt2: 2}
+	if err := d.handleGenerationChange(hdr); !errors.Is(err, ErrSnapshotRequired) {
+		t.Fatalf("the error does not ask for a new snapshot: %v", err)
+	}
+	if got := d.cursorPosition(); got.Salt1 != hdr.Salt1 || got.Salt2 != hdr.Salt2 {
+		t.Errorf("the cursor is at %s, want the generation %d/%d", got, hdr.Salt1, hdr.Salt2)
+	}
+	if err := d.handleGenerationChange(hdr); err != nil {
+		t.Errorf("the driver reported the reset of the WAL twice: %v", err)
+	}
+}
+
+// waitForWALBoundary waits until the driver knows the frame count of the
+// WAL.
+func waitForWALBoundary(t *testing.T, d *Driver) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		d.mu.Lock()
+		boundary := d.walBoundary
+		d.mu.Unlock()
+		if boundary > d.cursorPosition().Frame {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the driver did not observe the frame count of the WAL")
 }
 
 // TestResumePositionOfAnotherGenerationNeedsASnapshot checks that a resume
