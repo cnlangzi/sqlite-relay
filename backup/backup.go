@@ -69,6 +69,17 @@ type Stats struct {
 	LastAck time.Time
 	// Lag is the time since the last acknowledgement.
 	Lag time.Duration
+	// Connected reports that the backup is on the line with the source.
+	Connected bool
+	// Attempts is the number of the connections the backup opened since it
+	// started.
+	Attempts uint64
+	// ApplyErrors is the number of the transactions that could not be
+	// applied to the backup database.
+	ApplyErrors uint64
+	// CorruptSegments is the number of the segments that did not hold what
+	// they said.
+	CorruptSegments uint64
 	// LastError is the error of the last failure.
 	LastError string
 	// LastSnapshot is the time of the last snapshot that was installed.
@@ -353,6 +364,9 @@ func (p *Peer) Stats() Stats {
 		State:            state,
 		Epoch:            p.app.Epoch(),
 		LastAck:          p.proto.LastAck(),
+		Connected:        p.proto.Connected(),
+		Attempts:         p.proto.Attempts(),
+		CorruptSegments:  p.proto.CorruptSegments(),
 		SnapshotRequired: p.snapshotRequired,
 		SnapshotReason:   p.snapshotReason,
 	}
@@ -367,6 +381,7 @@ func (p *Peer) Stats() Stats {
 	}
 
 	st.LastSnapshot, st.LastSnapshotBytes, st.Snapshots = p.app.snapshotStats()
+	st.ApplyErrors = p.app.applyErrorCount()
 	applied, err := p.app.AppliedSeq(context.Background())
 	if err == nil {
 		st.AppliedSeq = applied

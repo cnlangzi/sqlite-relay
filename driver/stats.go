@@ -62,12 +62,30 @@ type Stats struct {
 	// the database file. A negative value means that SQLite could not
 	// report the state of the WAL.
 	BackfillFrames int
-	// WALFrames is the number of frames the WAL holds.
+	// WALFrames is the number of frames SQLite reports for the WAL: the
+	// frames that are committed in the current generation.
 	WALFrames int
+	// CommitFrames is the number of frames of the current WAL generation
+	// that are committed: the boundary of the last complete transaction in
+	// the log. The driver reads the boundary out of the WAL bytes while it
+	// captures, so the value is the boundary of the last capture round.
+	// WALFrames is the number of frames SQLite reports for the same
+	// generation at the moment the statistics are taken.
+	CommitFrames uint64
 	// WALBytes is the size of the WAL file.
 	WALBytes int64
 	// WALHighWater is the largest WAL file size the driver has seen.
 	WALHighWater int64
+	// Notifications is the number of commit notifications the WAL hook
+	// delivered to the consumer.
+	Notifications uint64
+	// DroppedNotifications is the number of notifications that the full
+	// channel of the notifications did not take.
+	DroppedNotifications uint64
+	// ScanCompensations is the number of capture rounds that returned
+	// transactions that no notification announced. The periodic scan of the
+	// driver found those transactions on its own.
+	ScanCompensations uint64
 	// Checkpoint describes the last checkpoint.
 	Checkpoint CheckpointStats
 	// Reclaim describes the last reclaim.

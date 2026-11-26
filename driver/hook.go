@@ -19,15 +19,38 @@ func (d *Driver) walHook(dbName string, frames int) (rc int) {
 			rc = 0
 		}
 	}()
-	d.notify(Notification{DBName: dbName, Frames: frames})
+	d.announce(Notification{DBName: dbName, Frames: frames})
 	return 0
 }
 
-// notify delivers a commit notification without blocking the writer.
+// announce hands the notification of a commit to the consumer.
 //
 // The channel is allowed to be full: a dropped notification only costs a
 // wake-up, the periodic scan finds the same commit anyway. The channel may
 // be closed already, a notification that nobody waits for is dropped.
+//
+// The counters tell how many commits the hook announced and how many of the
+// announcements the full channel swallowed.
+func (d *Driver) announce(n Notification) {
+	d.eventsMu.Lock()
+	defer d.eventsMu.Unlock()
+	if d.eventsClosed {
+		// The driver is closed: nobody waits for the notification any
+		// more, it is not a lost announcement.
+		return
+	}
+	select {
+	case d.events <- n:
+		d.notifications.Add(1)
+	default:
+		d.droppedNotifications.Add(1)
+	}
+}
+
+// notify delivers a wake-up hint to the consumer.
+//
+// The hint of the periodic scan is not the announcement of a commit: it
+// points at the frames the consumer did not capture yet. It is not counted.
 func (d *Driver) notify(n Notification) {
 	d.eventsMu.Lock()
 	defer d.eventsMu.Unlock()

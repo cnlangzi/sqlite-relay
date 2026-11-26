@@ -108,7 +108,36 @@ When SQLite resets the WAL while the driver did not capture all of its
 frames, the driver reports `ErrSnapshotRequired`: the increments of the
 frames that are gone are lost and the consumer needs a new baseline. The
 frames that the WAL held before the driver started do not count: the
-consumer holds the increments it has seen already.
+consumer holds the increments it has seen already. Only the frames of the
+generation that is reset count: the frames of the new generation start
+over and they are not lost.
+
+The driver reports the loss once and it continues in the new generation: it
+captures the frames of the new generation from its first frame. The consumer
+rebuilds its chain and takes a new baseline, the frames of the new generation
+follow that baseline.
+
+### The change counter
+
+`ChangeCounter` returns the change counter of the primary database. The
+change counter is a field of the file format of SQLite: it sits at offset 24
+of the first page of the database. The pager writes the new counter into the
+page 1 image of a transaction that writes page 1.
+
+The counter of the primary database is the counter of the newest page 1 image
+it holds: the image of the last committed transaction of the log that wrote
+page 1, or the page 1 of the database file when the log holds no such image.
+The counter does not depend on the generation of the log, so a consumer may
+compare it with the counter of a state it holds and find out whether the
+primary database is behind that state.
+
+The counter counts the writes of page 1 and not the transactions. The page 1
+images of one generation of the log carry the same counter, because the pager
+writes the counter of the database file plus one. The counter moves when the
+database file holds a newer page 1.
+
+The counter is 32 bits wide and it wraps around. Two counters are only
+comparable when fewer than 2^32 writes of page 1 lie between them.
 
 ### The WAL space
 
@@ -186,6 +215,32 @@ be cancelled.
 as well.
 
 The snapshot path does not need the quiesce gate.
+
+### The statistics
+
+`Stats` reports the state of the driver: the generation of the log, the
+capture cursor, the acknowledged position, the frames of the log, the
+checkpoint, the reclaim and the last error.
+
+| Field | Meaning |
+|---|---|
+| `Notifications` | the number of commit notifications the WAL hook delivered to the consumer |
+| `DroppedNotifications` | the number of notifications that the full channel of the notifications did not take |
+| `ScanCompensations` | the number of capture rounds that returned transactions that no notification announced |
+| `CommitFrames` | the number of frames of the current generation of the log that are committed: the boundary of the last complete transaction |
+| `WALFrames` | the number of frames SQLite reports for the log |
+
+The counters tell how the commits of the primary database reached the
+consumer. A notification that the full channel did not take costs a wake-up:
+the periodic scan finds the commit anyway, and the round that found it is
+counted as a scan compensation.
+
+`CommitFrames` and `WALFrames` answer the same question from two sides.
+`CommitFrames` is the boundary the driver read out of the bytes of the log
+while it captured, `WALFrames` is the number of frames SQLite reports for
+the log at the moment the statistics are taken. The two agree unless the log
+moved between the two reads. The frames of a transaction that did not commit
+are in neither of them.
 
 ## Not supported
 

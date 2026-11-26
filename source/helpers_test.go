@@ -3,6 +3,7 @@ package source
 import (
 	"cmp"
 	"context"
+	"database/sql"
 	"net"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cnlangzi/sqlite-relay/driver"
+	"github.com/cnlangzi/sqlite-relay/internal/wal"
 	"github.com/cnlangzi/sqlite-relay/protocol"
 	"github.com/cnlangzi/sqlite-relay/segment"
 	"github.com/cnlangzi/sqlite-relay/spool"
@@ -161,4 +163,108 @@ func waitFor(t *testing.T, cond func() bool) bool {
 		time.Sleep(5 * time.Millisecond)
 	}
 	return cond()
+}
+
+// testSink is the sink of a backup that connects to the runtime.
+//
+// The sink applies nothing: it is the connection to the runtime that the
+// tests look at.
+type testSink struct {
+	// epoch is the generation of the chain the sink is part of.
+	epoch uint64
+}
+
+// Apply applies a transaction of the chain.
+func (s *testSink) Apply(ctx context.Context, tx segment.Tx) error {
+	return nil
+}
+
+// AppliedSeq returns the sequence number the sink applied.
+func (s *testSink) AppliedSeq(ctx context.Context) (uint64, error) {
+	return 0, nil
+}
+
+// Epoch returns the generation of the chain the sink is part of.
+func (s *testSink) Epoch() uint64 {
+	return s.epoch
+}
+
+// keepLogOpen opens a connection that keeps the write-ahead log of the
+// database alive.
+//
+// The log is deleted when the last connection of the database closes: the
+// connection keeps the frames of the log around while the driver is closed.
+func keepLogOpen(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL")
+	if err != nil {
+		t.Fatalf("open the connection: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	db.SetMaxIdleConns(1)
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+	return db
+}
+
+// checkpoint writes the frames of the write-ahead log back into the database
+// file.
+//
+// The database file is consistent afterwards: a checkpoint that was
+// interrupted leaves it with pages of two different states. The log keeps its
+// frames.
+func checkpoint(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec("PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
+		t.Fatalf("checkpoint the database: %v", err)
+	}
+}
+
+// copyFile copies a file.
+func copyFile(t *testing.T, src, dst string) {
+	t.Helper()
+	b, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("read %s: %v", src, err)
+	}
+	if err := os.WriteFile(dst, b, 0o644); err != nil {
+		t.Fatalf("write %s: %v", dst, err)
+	}
+}
+
+// truncateLog cuts the tail of the write-ahead log of the primary database.
+//
+// The frames of the log are lost: the primary database lost the transactions
+// that were committed at the end of the log.
+func truncateLog(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Truncate(path, wal.HeaderSize+16); err != nil {
+		t.Fatalf("truncate the write-ahead log: %v", err)
+	}
+}
+
+// corruptLog writes garbage into the frame of the log at the given position.
+//
+// The frame fails the checksum of the log: the transactions that follow it
+// are lost.
+func corruptLog(t *testing.T, path string, pos spool.Pos) {
+	t.Helper()
+	hdr, err := wal.ReadHeader(path)
+	if err != nil {
+		t.Fatalf("read the header of the write-ahead log: %v", err)
+	}
+	off := int64(wal.HeaderSize) + int64(pos.Frame-1)*int64(hdr.FrameSize())
+	garbage := make([]byte, hdr.PageSize)
+	for i := range garbage {
+		garbage[i] = 0xff
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open the write-ahead log: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.WriteAt(garbage, off+int64(wal.FrameHeaderSize)); err != nil {
+		t.Fatalf("write the write-ahead log: %v", err)
+	}
 }

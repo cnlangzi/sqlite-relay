@@ -306,6 +306,25 @@ The source keeps serving after a resync. The backup that needs a new
 baseline asks for one in the hello of its next connection, the source sends
 it and the backup installs it over the database it had.
 
+## The state of the connection
+
+Both sides tell whether the peer is on the line and how often they met.
+
+| Method | Meaning |
+|---|---|
+| `Source.Connected` | a backup session runs |
+| `Source.Sessions` | the number of the sessions the source accepted since it started |
+| `Source.Resyncs` | the number of the resyncs the source asked the backup for since it started |
+| `Backup.Connected` | the session of the backup runs |
+| `Backup.Attempts` | the number of the connections the backup opened since it started |
+| `Backup.CorruptSegments` | the number of the segments that did not hold what they said |
+
+A session that failed the handshake is a session as well: the backup was on
+the line. Every dial is an attempt, a connection that fails the handshake as
+well.
+
+The counters start over with every run of the process.
+
 ## The interfaces
 
 The protocol package defines the interfaces of the two sides. The source side

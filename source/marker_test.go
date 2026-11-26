@@ -20,53 +20,96 @@ func TestJudgeChain(t *testing.T) {
 	marker := &cleanMarker{Seq: ack.Seq, Pos: markerPosOf(ack.Pos)}
 
 	for _, tc := range []struct {
-		name   string
-		ack    spool.Ack
-		gen    driver.Position
-		marker *cleanMarker
-		want   verdict
+		name    string
+		ack     spool.Ack
+		cursor  driver.Position
+		marker  *cleanMarker
+		primary changeCounter
+		chain   changeCounter
+		want    verdict
 	}{
 		{
-			name: "the chain is empty",
-			ack:  spool.Ack{},
-			gen:  driver.Position{Salt1: 11, Salt2: 22},
-			want: verdictUnknown,
+			name:   "the chain is empty",
+			ack:    spool.Ack{},
+			cursor: driver.Position{Salt1: 11, Salt2: 22},
+			want:   verdictUnknown,
 		},
 		{
-			name: "the driver does not know the generation",
-			ack:  ack,
-			gen:  driver.Position{},
-			want: verdictUnknown,
+			name:   "the driver does not know the generation",
+			ack:    ack,
+			cursor: driver.Position{},
+			want:   verdictUnknown,
 		},
 		{
-			name: "the log was not reset",
-			ack:  ack,
-			gen:  driver.Position{Salt1: 11, Salt2: 22, Frame: 87},
-			want: verdictContinuous,
+			name:   "the log was not reset",
+			ack:    ack,
+			cursor: driver.Position{Salt1: 11, Salt2: 22, Frame: 87},
+			want:   verdictContinuous,
 		},
 		{
 			name:   "the log was reset and the marker describes the chain",
 			ack:    ack,
-			gen:    driver.Position{Salt1: 33, Salt2: 44, Frame: 3},
+			cursor: driver.Position{Salt1: 33, Salt2: 44, Frame: 3},
 			marker: marker,
 			want:   verdictContinuous,
 		},
 		{
-			name: "the log was reset and there is no marker",
-			ack:  ack,
-			gen:  driver.Position{Salt1: 33, Salt2: 44, Frame: 3},
-			want: verdictBroken,
+			name:   "the log was reset and there is no marker",
+			ack:    ack,
+			cursor: driver.Position{Salt1: 33, Salt2: 44, Frame: 3},
+			want:   verdictBroken,
 		},
 		{
 			name:   "the log was reset and the marker describes another chain",
 			ack:    ack,
-			gen:    driver.Position{Salt1: 33, Salt2: 44, Frame: 3},
+			cursor: driver.Position{Salt1: 33, Salt2: 44, Frame: 3},
 			marker: &cleanMarker{Seq: 41, Pos: markerPosOf(ack.Pos)},
+			want:   verdictBroken,
+		},
+		{
+			name:    "the primary database is behind the chain",
+			ack:     ack,
+			cursor:  driver.Position{Salt1: 11, Salt2: 22, Frame: 87},
+			primary: changeCounter{value: 4, known: true},
+			chain:   changeCounter{value: 5, known: true},
+			want:    verdictBroken,
+		},
+		{
+			name:    "the primary database is behind the chain and the log was reset",
+			ack:     ack,
+			cursor:  driver.Position{Salt1: 33, Salt2: 44, Frame: 3},
+			marker:  marker,
+			primary: changeCounter{value: 4, known: true},
+			chain:   changeCounter{value: 5, known: true},
+			want:    verdictBroken,
+		},
+		{
+			name:    "the primary database is not behind the chain",
+			ack:     ack,
+			cursor:  driver.Position{Salt1: 11, Salt2: 22, Frame: 87},
+			primary: changeCounter{value: 5, known: true},
+			chain:   changeCounter{value: 5, known: true},
+			want:    verdictContinuous,
+		},
+		{
+			name:    "the counter of the chain is unknown",
+			ack:     ack,
+			cursor:  driver.Position{Salt1: 11, Salt2: 22, Frame: 87},
+			primary: changeCounter{value: 4, known: true},
+			want:    verdictContinuous,
+		},
+		{
+			name:   "the log holds fewer frames than the chain",
+			ack:    ack,
+			cursor: driver.Position{Salt1: 11, Salt2: 22, Frame: 86},
 			want:   verdictBroken,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := judgeChain(tc.ack, tc.gen, tc.marker); got != tc.want {
+			got := judgeChain(tc.ack, tc.cursor, tc.marker, func() (changeCounter, changeCounter) {
+				return tc.primary, tc.chain
+			})
+			if got != tc.want {
 				t.Errorf("the verdict is %d, want %d", got, tc.want)
 			}
 		})

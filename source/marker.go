@@ -155,19 +155,40 @@ func markerPosOf(pos spool.Pos) markerPos {
 // judgeChain decides whether the chain of the segments still covers the
 // primary database.
 //
+// The counters are read by the function counters: they are only needed when
+// the chain and the generation of the log are known.
+//
+// The change counters tell whether the primary database is behind the chain:
+// the counter of the chain and the counter of the primary database count the
+// same writes of page 1, so the primary database is behind when its counter
+// is the smaller one.
+//
 // The generation of the log tells whether the log was reset. A log that was
 // reset while the runtime was down may have lost the transactions that the
 // chain does not hold: the marker of the last clean close proves that it does
 // not.
-func judgeChain(ack spool.Ack, gen driver.Position, marker *cleanMarker) verdict {
+func judgeChain(ack spool.Ack, cursor driver.Position, marker *cleanMarker, counters func() (primary, chain changeCounter)) verdict {
 	switch {
 	case ack.Seq == 0:
 		// The chain is empty, there is nothing to judge.
 		return verdictUnknown
-	case gen.Salt1 == 0 && gen.Salt2 == 0:
+	case cursor.Salt1 == 0 && cursor.Salt2 == 0:
 		// The driver does not know the generation of the log yet.
 		return verdictUnknown
-	case ack.Pos.Salt1 == gen.Salt1 && ack.Pos.Salt2 == gen.Salt2:
+	}
+	primary, chain := counters()
+	switch {
+	case primary.known && chain.known && primary.value < chain.value:
+		// The primary database is behind the end of the chain: it lost the
+		// transactions the chain holds.
+		return verdictBroken
+	case ack.Pos.Salt1 == cursor.Salt1 && ack.Pos.Salt2 == cursor.Salt2:
+		if cursor.Frame < ack.Pos.Frame {
+			// The log holds fewer frames than the chain: the tail of the
+			// chain is gone and the primary database lost the
+			// transactions it holds.
+			return verdictBroken
+		}
 		// The log was not reset, the chain continues where it ended.
 		return verdictContinuous
 	case marker != nil && marker.Seq == ack.Seq && marker.Pos == markerPosOf(ack.Pos):

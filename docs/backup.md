@@ -283,11 +283,28 @@ chain and a new baseline is one automatic step.
 
 ## The statistics
 
-`Stats` reports the state of the backup: the applied sequence, the epoch, the
-time of the last acknowledgement and the lag behind the source, the error of
-the last failure, the time and the size of the last snapshot that was
-installed and the number of the times the backup asked for a snapshot with
-the reason of the last request.
+`Stats` reports the state of the backup:
+
+| Field | Meaning |
+|---|---|
+| `State` | the state of the backup: `syncing` or `paused` |
+| `AppliedSeq` | the sequence number the backup applied and persisted |
+| `Epoch` | the generation of the chain the backup is part of |
+| `LastAck` | the time of the last acknowledgement the backup sent |
+| `Lag` | the time since the last acknowledgement |
+| `Connected` | the source is on the line |
+| `Attempts` | the number of the connections the backup opened since it started |
+| `ApplyErrors` | the number of the transactions that could not be applied to the backup database |
+| `CorruptSegments` | the number of the segments that did not hold what they said |
+| `LastError` | the description of the last failure |
+| `LastSnapshot` | the time of the last snapshot that was installed |
+| `LastSnapshotBytes` | the size of the last snapshot that was installed |
+| `Snapshots` | the number of the snapshots that were installed |
+| `SnapshotRequired` | the number of the times the backup asked for a snapshot |
+| `SnapshotReason` | the reason of the last request for a snapshot |
+
+The counters describe the process that is running: they start over with
+every run.
 
 ## Not supported
 

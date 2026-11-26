@@ -382,3 +382,85 @@ func TestPeerRefusesToResumeWhileTheBusinessHoldsTheDatabase(t *testing.T) {
 		t.Fatal("the backup resumed while the business held the database")
 	}
 }
+
+// TestTheStatsReportTheConnectionOfTheSource checks that the statistics of
+// the backup tell whether the source is on the line and how many connections
+// the backup opened.
+func TestTheStatsReportTheConnectionOfTheSource(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+	primary := newTestDatabase(t, t.TempDir(), "primary.db", true)
+
+	src := &fakeSource{}
+	src.epoch = 3
+	provider := testSnapshotProvider(t, primary, cfg.Protocol.DatabaseID, 3, 10)
+	addr := startSource(t, cfg, src, provider)
+	p := startPeer(t, cfg, addr)
+
+	if !waitFor(t, func() bool { return p.Stats().AppliedSeq == 10 }) {
+		t.Fatalf("the backup applied the sequence number %d, want the baseline 10", p.Stats().AppliedSeq)
+	}
+	if !p.Stats().Connected {
+		t.Error("the backup is not connected although it applied the baseline")
+	}
+	if p.Stats().Attempts != 1 {
+		t.Errorf("the backup opened %d connections, want 1", p.Stats().Attempts)
+	}
+}
+
+// TestTheStatsCountTheApplyErrors checks that the statistics of the backup
+// count the transactions that could not be applied.
+func TestTheStatsCountTheApplyErrors(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+	primary := newTestDatabase(t, t.TempDir(), "primary.db", true)
+
+	src := &fakeSource{}
+	src.epoch = 3
+	provider := testSnapshotProvider(t, primary, cfg.Protocol.DatabaseID, 3, 10)
+	addr := startSource(t, cfg, src, provider)
+	p := startPeer(t, cfg, addr)
+	if !waitFor(t, func() bool { return p.Stats().AppliedSeq == 10 }) {
+		t.Fatalf("the backup applied the sequence number %d, want the baseline 10", p.Stats().AppliedSeq)
+	}
+
+	// The transaction holds a page that the database of the backup does not
+	// have: it cannot be applied.
+	tx := segment.Tx{
+		Seq:         11,
+		CommitPages: 1,
+		Pages:       []segment.Page{{Pgno: 2, Data: make([]byte, testPageSize)}},
+	}
+	seg := testSegment(t, cfg.Protocol.DatabaseID, 3, 11, tx)
+	src.add(protocol.Segment{SeqStart: 11, SeqEnd: 11, Epoch: 3, Bytes: seg})
+	if !waitFor(t, func() bool { return p.Stats().ApplyErrors == 1 }) {
+		t.Errorf("the backup counted %d apply errors, want 1", p.Stats().ApplyErrors)
+	}
+}
+
+// TestTheStatsCountTheCorruptSegments checks that the statistics of the
+// backup count the segments that did not hold what they said.
+func TestTheStatsCountTheCorruptSegments(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+	primary := newTestDatabase(t, t.TempDir(), "primary.db", true)
+
+	src := &fakeSource{}
+	src.epoch = 3
+	provider := testSnapshotProvider(t, primary, cfg.Protocol.DatabaseID, 3, 10)
+	addr := startSource(t, cfg, src, provider)
+	p := startPeer(t, cfg, addr)
+	if !waitFor(t, func() bool { return p.Stats().AppliedSeq == 10 }) {
+		t.Fatalf("the backup applied the sequence number %d, want the baseline 10", p.Stats().AppliedSeq)
+	}
+
+	// A segment whose payload does not hold what it says.
+	write(t, primary, "second")
+	tx := transaction(t, primary, 11)
+	seg := testSegment(t, cfg.Protocol.DatabaseID, 3, 11, tx)
+	seg[len(seg)-40] ^= 0xff
+	src.add(protocol.Segment{SeqStart: 11, SeqEnd: 11, Epoch: 3, Bytes: seg})
+	if !waitFor(t, func() bool { return p.Stats().CorruptSegments == 1 }) {
+		t.Errorf("the backup counted %d corrupt segments, want 1", p.Stats().CorruptSegments)
+	}
+}
