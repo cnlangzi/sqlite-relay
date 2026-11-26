@@ -322,42 +322,211 @@ losses within one generation of the log.
 
 ### Method
 
-The benchmark commits one transaction per iteration into a table with two
-columns. The three configurations are the primary database alone, the primary
-database with the source runtime and the primary database with the source
-runtime and a backup that applies the increments of the chain.
+The benchmarks of the relay live in the `e2e` package and in the `spool`
+package. The ones of the `e2e` package carry the build tag `e2e`: they start
+the two sides of a relay in their own processes and they talk over a real TCP
+connection. The target `make bench` runs them, one package after the other:
 
 ```
-go test -bench . -benchmem -run '^$' -tags e2e ./e2e/
+SQLITE_RELAY_E2E_ROOT=$PWD/.e2e-root go test -bench . -benchmem -run '^$' -tags e2e -p 1 ./e2e/ ./spool/
 ```
 
-Measured on Linux/amd64 with an Intel Core i5-2410M CPU at 2.30 GHz, Go
-1.27.3 and SQLite 3.54.1. The machine was busy while the numbers were taken,
-so they are an upper bound.
+The three configurations are the primary database alone, the primary database
+with the source runtime and the primary database with the source runtime and
+a backup that applies the increments of the chain.
 
-### Results
+| Benchmark | Load | Configuration |
+|---|---|---|
+| `BenchmarkTheRelayUnderLoad` | one transaction per iteration | the three configurations |
+| `BenchmarkTheCommitLatencyOfTheRelay` | one transaction per iteration | the three configurations |
+| `BenchmarkTheStatementThroughputOfTheRelay` | one transaction per iteration: an insert, an update, a delete and a transaction of a hundred rows | the three configurations |
+| `BenchmarkTheTransferOfTheSegments` | a backlog of 2000 transactions | relay with a backup |
+| `BenchmarkTheApplyOfTheSegments` | the same backlog | relay with a backup |
+| `BenchmarkTheCatchUpAfterADisconnect` | the same backlog, the backup is killed while it piles up | relay with a backup |
+| `BenchmarkTheResourcesDuringTheBackupPause` | 50 transactions per second for four seconds | relay with a backup, the backup is paused |
+| `BenchmarkTheSpoolSyncs` | transactions of 64 kilobytes | the three modes of the spool |
 
-| Benchmark | ns/op | WAL bytes | WAL frames |
+Measured on Linux/amd64 with an Intel Core i7-3537U CPU at 2.00 GHz, Go
+1.27.0 and SQLite 3.54.1. The work directories of the benchmarks are in the
+checkout, on the file system of the machine: the numbers of the transfer and
+of the apply are the numbers of the syncs of that file system. The numbers of
+one run are in the tables below: they depend on the machine and on the load of
+the machine.
+
+### The commit latency
+
+The latency of the commits of the business. The benchmark commits one
+transaction per iteration into a table with two columns.
+
+| Configuration | mean (ns) | p50 (ns) | p95 (ns) | p99 (ns) |
+|---|---|---|---|---|
+| `no-relay` | 33291 | 30523 | 43127 | 54826 |
+| `relay-without-backup` | 49495 | 43255 | 62781 | 118598 |
+| `relay-with-backup` | 57902 | 44979 | 67809 | 262846 |
+
+The source runtime costs thirteen microseconds on the median of the commits:
+the WAL hook of the driver hands the notification to the capture and it
+returns. The business does not wait for the capture, for the spool or for the
+network.
+
+The backup adds two microseconds to the median and it moves the tail of the
+distribution: the ninety-ninth percentile of the commits with a backup is
+six times their median. The backup applies the increments of the chain in
+the same process and the pages it writes compete with the writes of the
+business for the disk.
+
+### The throughput of the statements
+
+The number of the transactions per second of every statement of the business.
+Every iteration is one transaction.
+
+| Statement | `no-relay` | `relay-without-backup` | `relay-with-backup` |
 |---|---|---|---|
-| `BenchmarkTheRelayUnderLoad/no-relay` | 42388 | 634859072 | 154092 |
-| `BenchmarkTheRelayUnderLoad/relay-without-backup` | 46411 | 468509952 | 113716 |
-| `BenchmarkTheRelayUnderLoad/relay-with-backup` | 73611 | 432834872 | 105057 |
+| insert | 31001 | 19912 | 14558 |
+| update | 28628 | 18337 | 15444 |
+| delete | 13301 | 10089 | 8486 |
+| a transaction of a hundred rows | 823 | 712 | 646 |
 
-The source runtime costs four microseconds on the commit of the business:
-the WAL hook of the driver hands the notification to the capture and
-returns. The business does not wait for the capture, for the spool or for
-the network.
+A transaction of a hundred rows takes 1.2 milliseconds: it costs thirty-eight
+times a transaction of one row and it writes two and a half times as many
+rows per second. The source runtime costs fifty-six percent of the time of a
+transaction of one row and sixteen percent of the time of a transaction of a
+hundred rows: the commit of a big transaction writes a hundred times more
+pages and the capture of the source reads them all.
 
-The backup adds 27 microseconds to the commit of the business on this
-machine. The backup applies the increments of the chain in the same process
-and the pages it writes compete with the writes of the business for the
-disk.
+### The transfer of the segments
+
+The source pushes the segments of the chain to the backup over TCP. The
+backup is paused while the primary writes the backlog of 2000 transactions,
+the source keeps the increments in its spool and it pushes them as fast as it
+can after the resume.
+
+| Metric | Value |
+|---|---|
+| bandwidth of the chain | 145312 B/s |
+| average size of a segment | 22877 B |
+| segments of the backlog | 366 |
+
+The bandwidth is the number of the bytes of the chain per second, from the
+resume until the backup holds every increment. The segments are small: a
+capture round closes a segment and a segment holds the transactions of one
+round.
+
+The source publishes a segment and the backup makes the transactions of a
+segment durable before it acknowledges them: the bandwidth of the chain is
+the bandwidth of the syncs of the file system of the machine.
+
+### The apply of the segments
+
+The backup applies the increments of the chain one by one. The load is the
+same backlog of 2000 transactions.
+
+| Metric | Value |
+|---|---|
+| transactions applied per second | 42 |
+| time to apply the backlog | 47.89 s |
+
+The applier syncs the database of the backup and the state of the backup at
+the boundary of every segment: the rate of the apply is the rate of the
+syncs of the file system of the machine.
+
+### The catch-up after a disconnect
+
+The backup is killed and the primary writes the backlog of 2000 transactions
+while it is away. The backup comes back and the measurement starts when the
+backup is started again and ends when it holds every increment.
+
+| Metric | Value |
+|---|---|
+| time of the catch-up | 47.94 s |
+| transactions applied per second | 42 |
+| bandwidth of the chain | 174594 B/s |
+
+### The resources during the pause of the backup
+
+The backup is paused and the source keeps working: it captures the increments
+of the primary database and it writes them into its spool. The primary writes
+50 transactions per second for four seconds. The numbers are the resources of
+the process of the primary over the window of the pause.
+
+| Metric | Value |
+|---|---|
+| time of the CPU | 203 ms |
+| peak of the memory | 15104 kB |
+| blocks read | 0 |
+| blocks written | 5056 |
+| time of the window | 4.193 s |
+
+The source of a relay with a paused backup spends the CPU of the commit of
+the business and of the capture: it writes the increments into its spool and
+it does not push anything. The blocks it writes are the pages of the
+transactions and the segments of the spool.
+
+### The syncs of the spool
+
+The number of the fsyncs the spool runs per megabyte it writes. The
+transaction of the benchmark holds 64 kilobytes.
+
+| Mode | fsyncs per MiB |
+|---|---|
+| `OFF` | 0 |
+| `NORMAL` | 17.33 |
+| `FULL` | 63.49 |
+
+The barrier of `OFF` is the write of the operating system and it costs
+nothing. The barrier of `NORMAL` is a batch of 32 segments: the segments of
+the batch are synced one by one, the directory of the segments and the state
+of the capture are synced once. The barrier of `FULL` syncs the segment, the
+directory of the segments and the state of the capture on every transaction,
+and it costs nearly four times as much as the barrier of `NORMAL`.
+
+### The cost of the relay on the commit path
+
+The benchmark commits one transaction per iteration into a table with two
+columns.
+
+| Configuration | ns/op | WAL bytes | WAL frames |
+|---|---|---|---|
+| `no-relay` | 31893 | 156733072 | 38042 |
+| `relay-without-backup` | 49844 | 75676192 | 174 |
+| `relay-with-backup` | 62763 | 68495032 | 307 |
 
 The write-ahead log of the primary database grows with the number of the
 commits in every configuration: SQLite does not shrink the log, it writes
 the frames back into the database file and reuses the space of the log. The
 source runtime keeps the content of the log smaller: it acknowledges the
 frames it captured, the driver writes them back and the log starts over.
+
+## The example
+
+The directory `examples/relay` holds a program that shows how an application
+uses the relay. It opens a primary database, it attaches the source runtime
+to it, it connects a backup to the runtime, it writes rows, it waits for the
+backup to catch up, it pauses the backup, it reads the database of the backup
+while it is paused, it resumes the backup and it waits for the backup to catch
+up again.
+
+```
+go run ./examples/relay
+```
+
+The business reads the database of the backup only while the backup is
+paused: the relay writes the file of the backup itself while the backup is in
+sync.
+
+The program works in a temporary directory and removes it when it ends. The
+flag `-dir` names a work directory that is kept and that has to be empty, the
+flag `-addr` names the address the primary listens on.
+
+```
+go run ./examples/relay -dir /tmp/relay
+```
+
+The two sides of the relay run in one program in the example. A deployment
+runs the primary side with the application and the backup side on another
+machine: the example is the configuration of the primary side with the backup
+side next to it. The example prints the number of the rows of the primary
+database and of the database of the backup after every step.
 
 ## Not supported
 

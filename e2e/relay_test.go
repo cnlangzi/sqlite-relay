@@ -466,7 +466,7 @@ type fileState struct {
 }
 
 // fileStateOf returns the state of a file.
-func fileStateOf(t *testing.T, path string) fileState {
+func fileStateOf(t testing.TB, path string) fileState {
 	t.Helper()
 	info, err := os.Stat(path)
 	if err != nil {

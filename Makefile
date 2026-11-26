@@ -28,7 +28,7 @@ e2e: ## Run the end-to-end tests of the relay (E2E_PKGS to scope them)
 	$(GO) test -race -count=1 -timeout 25m -tags e2e $(E2E_PKGS)
 
 bench: ## Run the benchmarks
-	$(GO) test -bench . -benchmem -run '^$$' -tags e2e $(PKGS)
+	$(GO) test -bench . -benchmem -run '^$$' -tags e2e -p 1 $(PKGS)
 
 vet: ## Run go vet
 	$(GO) vet -tags e2e $(PKGS)
