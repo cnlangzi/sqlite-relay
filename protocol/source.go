@@ -42,6 +42,13 @@ type Source struct {
 	// number belongs to.
 	appliedEpoch uint64
 	lastErr      error
+	// sess is the session that runs now. It is nil while the source waits
+	// for a connection.
+	sess *sourceSession
+	// sessions counts the sessions the source accepted.
+	sessions uint64
+	// resyncs counts the resyncs the source asked the backup for.
+	resyncs uint64
 }
 
 // NewSource creates a source that pushes the segments of src.
@@ -91,6 +98,38 @@ func (s *Source) LastError() error {
 	return s.lastErr
 }
 
+// Connected reports whether a backup is on the line.
+//
+// The source serves one connection at a time: the backup is connected while
+// its session runs, the handshake is over and the source pushes the segments
+// of the chain.
+func (s *Source) Connected() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sess != nil
+}
+
+// Sessions returns the number of the sessions the source accepted.
+//
+// A session that failed the handshake is a session as well: the backup was
+// on the line. The count starts over with every run of the process.
+func (s *Source) Sessions() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sessions
+}
+
+// Resyncs returns the number of the resyncs the source asked the backup
+// for.
+//
+// A resync tells the backup that it needs a new baseline: the chain of the
+// segments is not continuous any more.
+func (s *Source) Resyncs() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.resyncs
+}
+
 // Serve accepts the connections of the backups.
 //
 // It runs one connection at a time. A connection that failed is ended and
@@ -115,6 +154,7 @@ func (s *Source) Serve(ctx context.Context, ln net.Listener) error {
 			}
 			return err
 		}
+		s.noteSession()
 		err = s.serveConn(ctx, c)
 		s.mu.Lock()
 		s.lastErr = err
@@ -130,8 +170,39 @@ func (s *Source) serveConn(ctx context.Context, c net.Conn) error {
 		wake: make(chan struct{}, 1),
 		done: make(chan struct{}),
 	}
+	defer s.clearSession(sess)
 	defer func() { _ = sess.conn.Close() }()
 	return sess.run(ctx)
+}
+
+// noteSession counts a session the source accepted.
+func (s *Source) noteSession() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessions++
+}
+
+// setSession remembers the session that runs now.
+func (s *Source) setSession(sess *sourceSession) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sess = sess
+}
+
+// clearSession forgets the session when it is over.
+func (s *Source) clearSession(sess *sourceSession) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sess == sess {
+		s.sess = nil
+	}
+}
+
+// noteResync counts a resync the source asked the backup for.
+func (s *Source) noteResync() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resyncs++
 }
 
 // allowed reports whether the backup may connect.
@@ -363,6 +434,8 @@ func (sess *sourceSession) handshake() error {
 	sess.limit = sess.src.cfg.MaxUnackedBytes
 	sess.needsSnapshot = hello.NeedsSnapshot
 	sess.mu.Unlock()
+	// The backup proved itself: it is on the line.
+	sess.src.setSession(sess)
 	return nil
 }
 
@@ -749,6 +822,7 @@ func (sess *sourceSession) sendError(code ErrorCode, msg string) {
 
 // sendResync tells the peer that a new snapshot is needed.
 func (sess *sourceSession) sendResync(reason ResyncReason, epoch, seq uint64) {
+	sess.src.noteResync()
 	_ = sess.conn.writeMessage(ResyncRequired{Reason: reason, Epoch: epoch, Seq: seq})
 }
 

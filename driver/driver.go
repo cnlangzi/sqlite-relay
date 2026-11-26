@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cnlangzi/sqlite-relay/internal/wal"
@@ -142,6 +143,7 @@ type Driver struct {
 	seq           uint64
 	walHighWater  int64
 	lastReclaim   time.Time
+	commitFrames  uint64
 	// changeCounter is the change counter of the primary database.
 	changeCounter uint32
 	// changeCounterSet reports that the change counter is known.
@@ -151,6 +153,15 @@ type Driver struct {
 	// checkpoints of the driver.
 	fenceMu sync.Mutex
 
+	// notifications counts the notifications the WAL hook delivered.
+	notifications atomic.Uint64
+	// droppedNotifications counts the notifications that the full channel
+	// of the notifications did not take.
+	droppedNotifications atomic.Uint64
+	// scanCompensations counts the capture rounds that returned
+	// transactions that no notification announced.
+	scanCompensations atomic.Uint64
+
 	// eventsMu guards the channel of the notifications.
 	eventsMu     sync.Mutex
 	eventsClosed bool
@@ -158,6 +169,12 @@ type Driver struct {
 	// captureMu serializes the capture rounds.
 	captureMu sync.Mutex
 	reader    *wal.Reader
+	// deliveredSeen is the number of the notifications that were delivered
+	// when the last capture round ended.
+	deliveredSeen uint64
+	// swallowedSeen is the number of the notifications that were swallowed
+	// when the last capture round ended.
+	swallowedSeen uint64
 
 	// ckptMu guards the checkpoint manager.
 	ckptMu     sync.Mutex
@@ -358,15 +375,19 @@ func (d *Driver) Stats() Stats {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	st := Stats{
-		Generation:     Position{Salt1: d.cursor.Salt1, Salt2: d.cursor.Salt2},
-		CaptureCursor:  d.cursor,
-		AckPosition:    d.ack,
-		BackfillFrames: ckpt,
-		WALFrames:      log,
-		WALHighWater:   d.walHighWater,
-		Checkpoint:     d.ckptStats,
-		Reclaim:        d.reclaimStats,
-		HookPanics:     d.hookPanics,
+		Generation:           Position{Salt1: d.cursor.Salt1, Salt2: d.cursor.Salt2},
+		CaptureCursor:        d.cursor,
+		AckPosition:          d.ack,
+		BackfillFrames:       ckpt,
+		WALFrames:            log,
+		CommitFrames:         d.commitFrames,
+		WALHighWater:         d.walHighWater,
+		Notifications:        d.notifications.Load(),
+		DroppedNotifications: d.droppedNotifications.Load(),
+		ScanCompensations:    d.scanCompensations.Load(),
+		Checkpoint:           d.ckptStats,
+		Reclaim:              d.reclaimStats,
+		HookPanics:           d.hookPanics,
 	}
 	if d.lastErr != nil {
 		st.LastError = d.lastErr.Error()
@@ -547,6 +568,10 @@ func (d *Driver) recover() error {
 		d.mu.Lock()
 		d.cursor = pos
 		d.cursorSet = true
+		// The position of the resume is the commit frame of the last
+		// transaction that was captured: the log holds at least that many
+		// committed frames.
+		d.commitFrames = pos.Frame
 		d.mu.Unlock()
 		return nil
 	}
@@ -606,11 +631,36 @@ func (d *Driver) capture(ctx context.Context) (Batch, error) {
 			return Batch{}, err
 		}
 		if !retry {
+			d.noteScanCompensation(batch)
 			return batch, nil
 		}
 		lastErr = errors.New("driver: the WAL kept moving while it was read")
 	}
 	return Batch{}, lastErr
+}
+
+// noteScanCompensation counts a capture round that found transactions that
+// no notification announced.
+//
+// The periodic scan of the driver backs the notifications of the WAL hook
+// up. A round that found transactions without a notification found them on
+// its own.
+//
+// The counters of the notifications are read at the end of the round and
+// compared with the counters of the round before it. A notification that
+// the driver counted after the round ended belongs to the round that finds
+// the commit it announced.
+func (d *Driver) noteScanCompensation(batch Batch) {
+	delivered := d.notifications.Load()
+	swallowed := d.droppedNotifications.Load()
+	covered := delivered != d.deliveredSeen
+	lost := swallowed != d.swallowedSeen
+	d.deliveredSeen = delivered
+	d.swallowedSeen = swallowed
+	if len(batch.Changes) == 0 || (covered && !lost) {
+		return
+	}
+	d.scanCompensations.Add(1)
 }
 
 // captureOnce runs a single capture round.
@@ -650,6 +700,7 @@ func (d *Driver) captureOnce(ctx context.Context) (Batch, bool, error) {
 	if err != nil {
 		return Batch{}, false, fmt.Errorf("driver: read WAL: %w", err)
 	}
+	d.noteCommitFrame(scan.CommitFrame)
 	d.noteChangeCounter(scan)
 	after, _, err := d.walFrames(ctx)
 	if err != nil {
@@ -762,6 +813,7 @@ func (d *Driver) handleGenerationChange(hdr wal.Header) error {
 		d.cursor = Position{Salt1: hdr.Salt1, Salt2: hdr.Salt2, WALOffset: walOffset(0, d.pageSize)}
 		d.cursorSet = true
 		d.walBoundary = 0
+		d.commitFrames = 0
 		d.clearAck()
 		return nil
 	}
@@ -783,6 +835,7 @@ func (d *Driver) handleGenerationChange(hdr wal.Header) error {
 	d.cursor = Position{Salt1: hdr.Salt1, Salt2: hdr.Salt2, Frame: 0, WALOffset: walOffset(0, d.pageSize)}
 	d.cursorSet = true
 	d.walBoundary = 0
+	d.commitFrames = 0
 	d.startFrames = 0
 	d.clearAck()
 	if lost > 0 {
@@ -817,6 +870,19 @@ func (d *Driver) noteWALBoundary(frames int) {
 	defer d.mu.Unlock()
 	if uint64(frames) > d.walBoundary {
 		d.walBoundary = uint64(frames)
+	}
+}
+
+// noteCommitFrame records the boundary of the committed frames of the WAL.
+//
+// The boundary is the frame of the last complete transaction of the
+// generation that is read now. The frames of a transaction that did not
+// commit are not part of it.
+func (d *Driver) noteCommitFrame(frame uint64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if frame > d.commitFrames {
+		d.commitFrames = frame
 	}
 }
 

@@ -34,6 +34,12 @@ type Backup struct {
 	pauseSeq uint64
 	lastErr  error
 
+	// attempts counts the connections the backup opened.
+	attempts uint64
+	// corruptSegments counts the segments that did not hold what they
+	// said.
+	corruptSegments uint64
+
 	// sourceEpoch is the generation of the chain the source is part of.
 	sourceEpoch uint64
 
@@ -137,6 +143,52 @@ func (b *Backup) LastAck() time.Time {
 	return b.lastAck
 }
 
+// Connected reports whether the backup is on the line with the source.
+//
+// The backup is connected while its session runs: the handshake is over and
+// the source pushes the segments of the chain.
+func (b *Backup) Connected() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sess != nil
+}
+
+// Attempts returns the number of the connections the backup opened.
+//
+// Every dial is an attempt, a connection that fails the handshake as well.
+// The count starts over with every run of the process.
+func (b *Backup) Attempts() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.attempts
+}
+
+// CorruptSegments returns the number of the segments that did not hold what
+// they said.
+//
+// A segment that does not hold its content ends the session: the chain of
+// the segments is not continuous any more and the backup needs a new
+// baseline.
+func (b *Backup) CorruptSegments() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.corruptSegments
+}
+
+// noteAttempt counts a connection the backup opened.
+func (b *Backup) noteAttempt() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.attempts++
+}
+
+// noteCorruptSegment counts a segment that did not hold what it said.
+func (b *Backup) noteCorruptSegment() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.corruptSegments++
+}
+
 // isPaused reports whether the backup is paused.
 func (b *Backup) isPaused() bool {
 	b.mu.Lock()
@@ -214,6 +266,7 @@ func (b *Backup) Resume(ctx context.Context, appliedSeq uint64) error {
 //
 // It reports whether the handshake succeeded.
 func (b *Backup) runSession(ctx context.Context, addr string) (bool, error) {
+	b.noteAttempt()
 	c, err := net.Dial("tcp", addr)
 	if err != nil {
 		return false, err
@@ -580,6 +633,7 @@ func (sess *backupSession) applyBatch(ctx context.Context, b Batch) error {
 		// segment cannot reach into the next one.
 		seg, err := segment.Read(bytes.NewReader(raw))
 		if err != nil {
+			sess.b.noteCorruptSegment()
 			sess.sendResync(ResyncCorrupt, sess.epochLocked(), 0)
 			return fmt.Errorf("%w: the segment does not hold what it says: %v", ErrResyncRequired, err)
 		}

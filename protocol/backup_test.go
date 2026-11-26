@@ -411,3 +411,58 @@ func TestBackupReportsResync(t *testing.T) {
 		t.Fatal("the run did not end")
 	}
 }
+
+// TestTheBackupCountsItsAttempts checks that the backup tells whether it is
+// on the line and how many connections it opened.
+func TestTheBackupCountsItsAttempts(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.BackoffMin = 20 * time.Millisecond
+	srv := newTestServer(t, cfg)
+
+	b, err := NewBackup(cfg, &fakeSink{})
+	if err != nil {
+		t.Fatalf("NewBackup: %v", err)
+	}
+	if b.Attempts() != 0 {
+		t.Errorf("the backup opened %d connections before it ran, want 0", b.Attempts())
+	}
+	if b.Connected() {
+		t.Error("the backup is connected before it ran")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go b.Run(ctx, srv.addr())
+
+	if !waitFor(t, 5*time.Second, func() bool { return b.Connected() }) {
+		t.Fatal("the backup does not see the source")
+	}
+	if b.Attempts() != 1 {
+		t.Errorf("the backup opened %d connections, want 1", b.Attempts())
+	}
+
+	// The connection breaks, the backup opens a new one.
+	srv.closeConns()
+	if !waitFor(t, 5*time.Second, func() bool { return b.Attempts() >= 2 }) {
+		t.Errorf("the backup opened %d connections, want at least 2", b.Attempts())
+	}
+}
+
+// TestTheBackupCountsTheCorruptSegments checks that the backup counts the
+// segments that did not hold what they said.
+func TestTheBackupCountsTheCorruptSegments(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.BackoffMin = 20 * time.Millisecond
+	srv := newTestServer(t, cfg)
+	b := startBackup(t, cfg, &fakeSink{}, srv.addr())
+
+	if !waitFor(t, 5*time.Second, func() bool { return srv.helloCount() == 1 }) {
+		t.Fatal("the backup did not connect")
+	}
+	seg := testSegment(t, cfg.DatabaseID, 0, 1, 2)
+	seg[len(seg)-40] ^= 0xff
+	srv.send(Batch{Segments: [][]byte{seg}})
+	if !waitFor(t, 5*time.Second, func() bool { return b.CorruptSegments() == 1 }) {
+		t.Errorf("the backup counted %d corrupt segments, want 1", b.CorruptSegments())
+	}
+}

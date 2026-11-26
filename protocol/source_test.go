@@ -795,3 +795,64 @@ func TestPackBatch(t *testing.T) {
 		t.Fatal("a segment without bytes was accepted")
 	}
 }
+
+// TestTheSourceCountsItsSessions checks that the source tells whether a
+// backup is on the line and how many sessions it accepted.
+func TestTheSourceCountsItsSessions(t *testing.T) {
+	cfg := testConfig(t)
+	src := &fakeSource{}
+	addr, source, _ := startSource(t, cfg, src)
+
+	if source.Connected() {
+		t.Error("the source is connected before a backup showed up")
+	}
+	if source.Sessions() != 0 {
+		t.Errorf("the source accepted %d sessions, want 0", source.Sessions())
+	}
+
+	cl := dialClient(t, addr)
+	cl.write(testHello(t, cfg, testToken))
+	if _, _, err := cl.read(); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !waitFor(t, 5*time.Second, func() bool { return source.Connected() }) {
+		t.Fatal("the source does not see the backup")
+	}
+	if source.Sessions() != 1 {
+		t.Errorf("the source accepted %d sessions, want 1", source.Sessions())
+	}
+
+	// The backup goes away.
+	cl.conn.Close()
+	if !waitFor(t, 5*time.Second, func() bool { return !source.Connected() }) {
+		t.Fatal("the source still sees the backup")
+	}
+
+	// A backup that comes back is another session.
+	cl2 := dialClient(t, addr)
+	cl2.write(testHello(t, cfg, testToken))
+	if _, _, err := cl2.read(); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !waitFor(t, 5*time.Second, func() bool { return source.Sessions() == 2 }) {
+		t.Errorf("the source accepted %d sessions, want 2", source.Sessions())
+	}
+}
+
+// TestTheSourceCountsItsResyncs checks that the source counts the resyncs
+// it asked the backup for.
+func TestTheSourceCountsItsResyncs(t *testing.T) {
+	cfg := testConfig(t)
+	src := &fakeSource{}
+	src.add(Segment{SeqStart: 5, SeqEnd: 6, Bytes: []byte("a segment")})
+	addr, source, _ := startSource(t, cfg, src)
+
+	cl := dialClient(t, addr)
+	cl.write(testHello(t, cfg, testToken))
+	if _, _, err := cl.read(); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !waitFor(t, 5*time.Second, func() bool { return source.Resyncs() == 1 }) {
+		t.Errorf("the source asked for %d resyncs, want 1", source.Resyncs())
+	}
+}

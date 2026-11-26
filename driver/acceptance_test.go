@@ -12,6 +12,99 @@ import (
 	"github.com/cnlangzi/sqlite-relay/internal/wal"
 )
 
+// TestTheNotificationsOfTheHookAreCounted checks that the statistics of the
+// driver tell how many commits the hook announced, how many of the
+// announcements the full channel of the notifications swallowed and how often
+// the periodic scan had to find a commit on its own.
+//
+// A swallowed notification costs a wake-up and nothing else: the scan finds
+// the commit anyway.
+func TestTheNotificationsOfTheHookAreCounted(t *testing.T) {
+	d, _ := newTestDriver(t, Config{EventBuffer: 1})
+	createTable(t, d)
+	scanAll(t, d)
+
+	// The notification of the table reached the consumer.
+	before := d.Stats()
+	if before.Notifications != 1 {
+		t.Errorf("the driver counted %d notifications, want 1", before.Notifications)
+	}
+
+	// The channel of the notifications holds the notification of the table,
+	// the notification of the insert does not fit into it any more.
+	insert(t, d, "a")
+	after := d.Stats()
+	if after.Notifications != before.Notifications {
+		t.Errorf("the driver counted %d notifications, want %d", after.Notifications, before.Notifications)
+	}
+	if after.DroppedNotifications <= before.DroppedNotifications {
+		t.Errorf("the driver counted %d swallowed notifications, want more than %d",
+			after.DroppedNotifications, before.DroppedNotifications)
+	}
+
+	// The capture round finds the transaction of the insert, no
+	// notification announced it.
+	scanAll(t, d)
+	after = d.Stats()
+	if after.ScanCompensations != before.ScanCompensations+1 {
+		t.Errorf("the driver counted %d scan compensations, want %d",
+			after.ScanCompensations, before.ScanCompensations+1)
+	}
+}
+
+// TestTheCommitBoundaryIsTheLastCompleteTransaction checks that the commit
+// boundary of the statistics names the frame of the last committed
+// transaction and that the frames of an open transaction are not part of it.
+//
+// The frames of an open transaction are in the log, they belong to a
+// transaction that may still fail.
+func TestTheCommitBoundaryIsTheLastCompleteTransaction(t *testing.T) {
+	d, _ := newTestDriver(t, Config{})
+	createTable(t, d)
+	insert(t, d, "a")
+	changes := scanAll(t, d)
+
+	want := changes[len(changes)-1].Pos.Frame
+	st := d.Stats()
+	if st.CommitFrames != want {
+		t.Errorf("the driver reports %d committed frames, want %d", st.CommitFrames, want)
+	}
+	if st.WALFrames < int(want) {
+		t.Errorf("SQLite reports %d frames in the log, want at least %d", st.WALFrames, want)
+	}
+	initial := st
+
+	// A transaction that spills into the log without committing.
+	ctx := context.Background()
+	conn, err := d.DB().Conn(ctx)
+	if err != nil {
+		t.Fatalf("conn: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "PRAGMA cache_size=10"); err != nil {
+		t.Fatalf("cache_size: %v", err)
+	}
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	for range 64 {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO t(v) VALUES(?)", string(make([]byte, 4000))); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	st = d.Stats()
+	if st.WALBytes <= initial.WALBytes {
+		t.Fatal("the log did not grow")
+	}
+	if st.CommitFrames != want {
+		t.Errorf("the driver reports %d committed frames, want %d", st.CommitFrames, want)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+}
+
 // TestIncrementBoundaryComesFromTheWAL checks that the boundary of an
 // increment is decided by the bytes of the WAL and not by the frame count the
 // WAL hook reports.

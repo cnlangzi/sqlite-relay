@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cnlangzi/sqlite-relay/driver"
+	"github.com/cnlangzi/sqlite-relay/protocol"
 	"github.com/cnlangzi/sqlite-relay/snapshot"
 	"github.com/cnlangzi/sqlite-relay/spool"
 )
@@ -586,4 +587,67 @@ func TestTheRuntimeFillsTheSpoolDirectory(t *testing.T) {
 		t.Errorf("the spool does not live in %s: %v", cfg.Spool.Root, err)
 	}
 	p.Stats()
+}
+
+// TestTheStatsReportTheConnectionOfTheBackup checks that the statistics of
+// the runtime tell whether a backup is on the line and how many sessions it
+// accepted.
+func TestTheStatsReportTheConnectionOfTheBackup(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(t, dir)
+	d, _ := newTestDriver(t, dir)
+	cfg.Driver = d
+	createTable(t, d)
+
+	p, addr := startPeerAt(t, cfg)
+	if p.Stats().Connected {
+		t.Error("the runtime is connected before a backup showed up")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	b, err := protocol.NewBackup(cfg.Protocol, &testSink{epoch: p.Stats().Spool.Epoch})
+	if err != nil {
+		t.Fatalf("NewBackup: %v", err)
+	}
+	go b.Run(ctx, addr)
+
+	if !waitFor(t, func() bool { return p.Stats().Connected }) {
+		t.Fatal("the runtime does not see the backup")
+	}
+	if p.Stats().Sessions != 1 {
+		t.Errorf("the runtime accepted %d sessions, want 1", p.Stats().Sessions)
+	}
+
+	// The backup goes away.
+	cancel()
+	if !waitFor(t, func() bool { return !p.Stats().Connected }) {
+		t.Fatal("the runtime still sees the backup")
+	}
+}
+
+// TestTheStatsCountTheResyncsOfTheRuntime checks that the statistics of the
+// runtime count the resyncs the source asked the backup for.
+func TestTheStatsCountTheResyncsOfTheRuntime(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(t, dir)
+	d, _ := newTestDriver(t, dir)
+	cfg.Driver = d
+	createTable(t, d)
+
+	p, addr := startPeerAt(t, cfg)
+
+	// The backup belongs to another generation of the chain: the source
+	// asks it for a new baseline.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	b, err := protocol.NewBackup(cfg.Protocol, &testSink{epoch: p.Stats().Spool.Epoch + 1})
+	if err != nil {
+		t.Fatalf("NewBackup: %v", err)
+	}
+	go b.Run(ctx, addr)
+
+	if !waitFor(t, func() bool { return p.Stats().Resyncs == 1 }) {
+		t.Errorf("the runtime asked for %d resyncs, want 1", p.Stats().Resyncs)
+	}
 }

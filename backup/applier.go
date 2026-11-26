@@ -92,6 +92,9 @@ type applier struct {
 	snapshotBytes int64
 	// snapshots is the number of the snapshots that were installed.
 	snapshots int
+	// applyErrors is the number of the transactions that could not be
+	// applied.
+	applyErrors uint64
 }
 
 // open opens the file of the backup database.
@@ -135,6 +138,14 @@ func (a *applier) snapshotStats() (time.Time, int64, int) {
 	return a.snapshotAt, a.snapshotBytes, a.snapshots
 }
 
+// applyErrorCount returns the number of the transactions that could not be
+// applied.
+func (a *applier) applyErrorCount() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.applyErrors
+}
+
 // Apply applies a transaction of the chain.
 //
 // The pages of the transaction are written into the file of the backup
@@ -148,6 +159,9 @@ func (a *applier) Apply(ctx context.Context, tx segment.Tx) error {
 		a.mu.Lock()
 		if !a.paused {
 			err := a.applyTx(tx)
+			if err != nil {
+				a.applyErrors++
+			}
 			a.mu.Unlock()
 			return err
 		}
