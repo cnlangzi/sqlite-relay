@@ -49,8 +49,12 @@ flowchart LR
 ## Installation
 
 ```bash
-go get github.com/cnlangzi/sqlite-relay
+go get github.com/cnlangzi/sqlite-relay@main
 ```
+
+The repository carries no tag, so the version query is needed: `go get`
+without one asks for the latest release and the module has none. The query
+resolves a pseudo-version of the default branch.
 
 The `go.mod` of the consuming program needs the `replace` of the fork:
 
@@ -62,19 +66,32 @@ The `replace` has to sit in the main module of the consuming program. A
 `replace` of a dependency is ignored, so a `replace` inside a module that is
 only a dependency of the program has no effect.
 
-The reason is the WAL hook. The driver installs it on every connection it
-opens (`RegisterWalHook`, `driver/connection.go:276`) and reads the
+The fork carries its own module path, so the requirement of the upstream path
+has to be there as well, and `go mod tidy` cannot place it:
+
+```bash
+go get github.com/mattn/go-sqlite3
+```
+
+That command adds the requirement and the entries of the `go.sum`.
+`go mod tidy` reports that the fork is used for two different module paths
+and it changes nothing, so the `go.mod` of the consuming program keeps the
+requirement by hand. The `go.mod` of this repository does the same.
+
+The reason for the `replace` is the WAL hook. The driver installs it on every
+connection it opens (`RegisterWalHook` in `driver/connection.go`) and reads the
 committed transactions out of the write-ahead log through it. The hook exists
-only in the fork: upstream `mattn/go-sqlite3` v1.14.52 does not carry it, so
+only in the fork: upstream `mattn/go-sqlite3` v1.14.53 does not carry it, so
 the program does not compile without the `replace`.
 
 The toolchain is Go 1.27 or later, the version of the `go 1.27` directive of
 the `go.mod` of this repository.
 
-The repository carries no tag, so `go get` resolves a pseudo-version of the
-default branch.
-
 ## Quick start
+
+Both sides read the shared token of the deployment from a file. The file has
+to exist, it must not be empty and both sides have to hold the same bytes:
+the handshake proves it with a message authentication code.
 
 ### The primary side
 
@@ -115,11 +132,13 @@ if err != nil {
 return peer.Run(ctx, ln)
 ```
 
-The application closes the driver and it closes the source runtime; the
-runtime never closes the driver for it. The runtime writes the transactions
-that are still pending into the spool and it marks the chain of the segments
-as complete, so the application stops writing to the primary database before
-it closes the runtime.
+The application closes the source runtime first and the driver second. The
+runtime captures the transactions that are still pending, writes them into the
+spool and marks the chain of the segments as complete, and it can only do
+that while the write-ahead log of the primary database is still there: the
+driver removes the log when it closes its last connection. The application
+stops writing to the primary database before it closes the runtime, because a
+transaction that is committed afterwards is not in the chain.
 
 ### The business code
 
@@ -222,9 +241,10 @@ The backup database of the backup side, below `backup.Config.Root`:
 | `source.Peer.Stats().Spool` (`spool.Stats`) | `BrokenReason` | why the chain of the segments is broken |
 
 The spool of the primary side grows while the backup is offline: the source
-keeps the segments the backup did not acknowledge.
-`spool.Config.MaxBytes` and `spool.Config.WarnBytes` are the brake, and
-`spool.Stats.Warn` reports that the spool is over the warning line.
+keeps the segments the backup did not acknowledge. `spool.Config.MaxBytes` is
+the brake: the spool refuses the transactions that do not fit into it.
+`spool.Config.WarnBytes` is the line the spool warns about, and
+`spool.Stats.Warn` reports that the spool is over it.
 
 A full spool stops the capture without stopping the business. The runtime
 keeps the transactions that do not fit into the spool and writes them as soon
