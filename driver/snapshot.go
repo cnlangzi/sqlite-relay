@@ -243,12 +243,12 @@ func readBaseline(path string) (baseline, error) {
 	}
 	defer func() { _ = f.Close() }()
 	// The change counter of page 1 sits at offset 24.
-	var head [28]byte
+	var head [changeCounterOffset + 4]byte
 	if _, err := io.ReadFull(f, head[:]); err != nil {
 		return baseline{}, fmt.Errorf("driver: read database header: %w", err)
 	}
 	return baseline{
-		changeCounter: binary.BigEndian.Uint32(head[24:28]),
+		changeCounter: binary.BigEndian.Uint32(head[changeCounterOffset:]),
 		size:          info.Size(),
 		modTime:       info.ModTime(),
 	}, nil

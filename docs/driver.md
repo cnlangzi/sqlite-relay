@@ -108,7 +108,36 @@ When SQLite resets the WAL while the driver did not capture all of its
 frames, the driver reports `ErrSnapshotRequired`: the increments of the
 frames that are gone are lost and the consumer needs a new baseline. The
 frames that the WAL held before the driver started do not count: the
-consumer holds the increments it has seen already.
+consumer holds the increments it has seen already. Only the frames of the
+generation that is reset count: the frames of the new generation start
+over and they are not lost.
+
+The driver reports the loss once and it continues in the new generation: it
+captures the frames of the new generation from its first frame. The consumer
+rebuilds its chain and takes a new baseline, the frames of the new generation
+follow that baseline.
+
+### The change counter
+
+`ChangeCounter` returns the change counter of the primary database. The
+change counter is a field of the file format of SQLite: it sits at offset 24
+of the first page of the database. The pager writes the new counter into the
+page 1 image of a transaction that writes page 1.
+
+The counter of the primary database is the counter of the newest page 1 image
+it holds: the image of the last committed transaction of the log that wrote
+page 1, or the page 1 of the database file when the log holds no such image.
+The counter does not depend on the generation of the log, so a consumer may
+compare it with the counter of a state it holds and find out whether the
+primary database is behind that state.
+
+The counter counts the writes of page 1 and not the transactions. The page 1
+images of one generation of the log carry the same counter, because the pager
+writes the counter of the database file plus one. The counter moves when the
+database file holds a newer page 1.
+
+The counter is 32 bits wide and it wraps around. Two counters are only
+comparable when fewer than 2^32 writes of page 1 lie between them.
 
 ### The WAL space
 

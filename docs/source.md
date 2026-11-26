@@ -179,8 +179,18 @@ waits for the generation of the log: a log that does not exist yet has none.
 
 - The durable acknowledgement of the spool is zero: the chain is empty, the
   runtime starts a new chain.
-- The generation of the durable acknowledgement is the generation of the log:
-  the log was not reset, the runtime continues where the chain ended.
+- The change counter of the primary database is smaller than the change
+  counter of the end of the chain: the primary database is behind the chain,
+  it lost transactions that the chain holds. The runtime resets the chain, it
+  takes a snapshot of the primary database and it tells the backup that it
+  needs a new baseline.
+- The generation of the durable acknowledgement is the generation of the log
+  and the log holds the frames of the chain: the log was not reset, the
+  runtime continues where the chain ended.
+- The generation of the durable acknowledgement is the generation of the log
+  and the log holds fewer frames than the chain: the tail of the chain is gone,
+  the primary database lost the transactions of the chain. The runtime resets
+  the chain.
 - The generation of the log is another one and the marker of the last clean
   close describes the end of the chain: the log was reset after the runtime
   closed, the chain was complete then and the reset lost nothing. The chain
@@ -234,6 +244,58 @@ would collect the segments of the new chain before the backup applied them.
 A log that was reset while the runtime was down breaks the chain as well: the
 runtime judges the chain when it starts, see
 [the restart and the continuity](#the-restart-and-the-continuity).
+
+## Persistence and the fault models
+
+The chain of the segments lives in the spool. The segments are the truth of
+the chain: the state file of the spool is an accelerator and the marker of
+the clean close is a record of the past. The runtime judges the chain once,
+when it starts, and it repairs the chain when the judge finds that the chain
+does not cover the primary database.
+
+Four faults reach the relay. They lose different things and they are covered
+by different layers.
+
+| Fault | What is lost | What covers it |
+|---|---|---|
+| The process of the source is killed | nothing: the kernel keeps the pages of the log and of the segments | the chain continues: the log keeps its generation and the segments of the spool are the truth |
+| The operating system crashes | the pages of the log and of the segments that the kernel did not write back | the barrier of the spool: the durable acknowledgement only names the segments that passed it |
+| The machine loses power | the same as the operating system crashes and the pages of the log that SQLite did not sync | the barrier of the spool, the synchronous pragma of the primary database and the judge of the chain |
+| The disk is damaged | the pages that the damage reached | the checksum of the segments and the judge of the chain: the chain is rebuilt |
+
+The end-to-end tests kill the process of the primary. The tests of the source
+package inject the other faults into the files: they truncate the write-ahead
+log of the primary database, they remove it, they write garbage into it and
+they make the directory of the spool read-only.
+
+### The change counter
+
+The change counter is a field of the file format of SQLite: it sits at offset
+24 of the first page of the database. The pager writes the new counter into
+the page 1 image of a transaction that writes page 1.
+
+The counter counts the writes of page 1 and not the transactions: the page 1
+images of one generation of the log carry the same counter, because the pager
+writes the counter of the database file plus one. The counter moves when the
+database file holds a newer page 1.
+
+The counter of the end of the chain and the counter of the primary database
+count the same writes of page 1: the primary database is behind the chain when
+its counter is the smaller one. The counter does not depend on the generation
+of the log, so it also finds the transactions that the primary database lost
+when the log was reset.
+
+The transactions of the chain that do not write page 1 do not move the
+counter: the position of the chain in the log tells in that case whether the
+log still holds the transactions of the chain.
+
+The counter is 32 bits wide and it wraps around. A counter that wrapped is
+smaller than the counter it follows: the decision rebuilds the chain once more
+than it has to. The direction is the safe one, a chain that is rebuilt too
+often costs a snapshot and a chain that is not rebuilt when it has to be costs
+the data of the primary database. The decision misses a loss that does not
+span a write of page 1: the position of the chain in the log covers the
+losses within one generation of the log.
 
 ## The statistics
 
