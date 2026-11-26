@@ -142,6 +142,10 @@ type Driver struct {
 	seq           uint64
 	walHighWater  int64
 	lastReclaim   time.Time
+	// changeCounter is the change counter of the primary database.
+	changeCounter uint32
+	// changeCounterSet reports that the change counter is known.
+	changeCounterSet bool
 
 	// fenceMu serialises the observation of the backfill count with the
 	// checkpoints of the driver.
@@ -618,7 +622,19 @@ func (d *Driver) captureOnce(ctx context.Context) (Batch, bool, error) {
 		}
 		return Batch{}, false, err
 	}
-	hdr := reader.Header()
+	// The reader may hold the header of a generation that SQLite has reset
+	// in the meantime. The log on the disk names the generation that the
+	// driver compares with, so a reader with a stale header is replaced
+	// before the cursor is moved.
+	reader, hdr, err := d.currentReader(reader)
+	if errors.Is(err, wal.ErrNoWAL) {
+		// The WAL is gone. SQLite removes it when the last connection
+		// closes the database, so there is nothing left to capture.
+		return Batch{}, false, nil
+	}
+	if err != nil {
+		return Batch{}, false, err
+	}
 
 	// The WAL was reset since the last round. The cursor moves to the new
 	// generation, but only if the old one was captured completely.
@@ -634,6 +650,7 @@ func (d *Driver) captureOnce(ctx context.Context) (Batch, bool, error) {
 	if err != nil {
 		return Batch{}, false, fmt.Errorf("driver: read WAL: %w", err)
 	}
+	d.noteChangeCounter(scan)
 	after, _, err := d.walFrames(ctx)
 	if err != nil {
 		return Batch{}, false, err
@@ -700,6 +717,34 @@ func (d *Driver) batchOf(scan *wal.Scan, from Position) Batch {
 	return batch
 }
 
+// currentReader returns the reader of the WAL and the header it reads.
+//
+// The reader holds the header of the generation it opened. SQLite resets the
+// WAL while the driver holds it: the reader is replaced by one that holds the
+// generation of the log on the disk.
+//
+// The error is wal.ErrNoWAL when the log is gone: SQLite removes it when the
+// last connection of the database closes.
+func (d *Driver) currentReader(reader *wal.Reader) (*wal.Reader, wal.Header, error) {
+	hdr := reader.Header()
+	onDisk, err := wal.ReadHeader(d.walPath)
+	if err != nil {
+		d.resetReader()
+		return nil, hdr, err
+	}
+	if onDisk.Salt1 == hdr.Salt1 && onDisk.Salt2 == hdr.Salt2 {
+		return reader, hdr, nil
+	}
+	// The log on the disk is another generation: the reader reads frames of
+	// a generation that is gone.
+	d.resetReader()
+	reader, err = d.walReader()
+	if err != nil {
+		return nil, hdr, err
+	}
+	return reader, reader.Header(), nil
+}
+
 // handleGenerationChange moves the cursor to a new WAL generation.
 //
 // The old generation has to be captured completely, otherwise the increments
@@ -724,15 +769,25 @@ func (d *Driver) handleGenerationChange(hdr wal.Header) error {
 	// business of the consumer: it holds the ones it has seen already.
 	// Only the frames that the driver had a chance to capture are lost
 	// when the log is reset.
-	lost := d.walBoundary - max(d.cursor.Frame, d.startFrames)
-	if lost > 0 {
-		return fmt.Errorf("%w: the WAL was reset with %d of %d frames uncaptured", ErrSnapshotRequired, lost, d.walBoundary)
+	reference := max(d.cursor.Frame, d.startFrames)
+	lost := uint64(0)
+	if d.walBoundary > reference {
+		lost = d.walBoundary - reference
 	}
+	boundary := d.walBoundary
+	// The cursor moves to the new generation even when the frames are
+	// lost. The consumer needs a new baseline and the driver captures the
+	// frames of the new generation. A cursor that stays in the old
+	// generation reports the same loss in every round and the consumer
+	// rebuilds its chain over and over.
 	d.cursor = Position{Salt1: hdr.Salt1, Salt2: hdr.Salt2, Frame: 0, WALOffset: walOffset(0, d.pageSize)}
 	d.cursorSet = true
 	d.walBoundary = 0
 	d.startFrames = 0
 	d.clearAck()
+	if lost > 0 {
+		return fmt.Errorf("%w: the WAL was reset with %d of %d frames uncaptured", ErrSnapshotRequired, lost, boundary)
+	}
 	return nil
 }
 
@@ -760,6 +815,33 @@ func (d *Driver) noteWALBoundary(frames int) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if uint64(frames) > d.walBoundary {
+		d.walBoundary = uint64(frames)
+	}
+}
+
+// noteBoundary records the number of committed frames of the generation the
+// cursor is in.
+//
+// The frames of a generation start over when SQLite resets the log: the count
+// of another generation says nothing about the frames of the generation that
+// is reset. The header of the log on the disk names the generation the count
+// belongs to.
+func (d *Driver) noteBoundary(frames int) {
+	if frames < 0 {
+		return
+	}
+	hdr, err := wal.ReadHeader(d.walPath)
+	if err != nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if hdr.Salt1 != d.cursor.Salt1 || hdr.Salt2 != d.cursor.Salt2 {
+		// The log on the disk is another generation than the one the cursor
+		// is in: the count belongs to that generation.
+		return
+	}
 	if uint64(frames) > d.walBoundary {
 		d.walBoundary = uint64(frames)
 	}
@@ -844,7 +926,7 @@ func (d *Driver) tick() {
 		d.recordError(err)
 	}
 	if log, _, err := d.walFrames(ctx); err == nil && log >= 0 {
-		d.noteWALBoundary(log)
+		d.noteBoundary(log)
 		if uint64(log) > d.cursorPosition().Frame {
 			d.notify(Notification{DBName: "main", Frames: log})
 		}

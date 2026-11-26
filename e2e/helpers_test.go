@@ -26,6 +26,7 @@ import (
 
 	"github.com/cnlangzi/sqlite-relay/backup"
 	"github.com/cnlangzi/sqlite-relay/driver"
+	"github.com/cnlangzi/sqlite-relay/internal/wal"
 	"github.com/cnlangzi/sqlite-relay/protocol"
 	"github.com/cnlangzi/sqlite-relay/source"
 	"github.com/cnlangzi/sqlite-relay/spool"
@@ -118,6 +119,14 @@ type settings struct {
 	// Retention is the time a segment of the spool is kept after the
 	// backup acknowledged it. It is given in seconds.
 	Retention int64 `json:"retention"`
+	// ReclaimInterval is the interval of the reclaim of the write-ahead log
+	// of the primary database. It is given in seconds. Zero means the
+	// default of the driver.
+	//
+	// A reclaim writes the whole log back into the database file and it
+	// empties the log: the frames of the log are gone afterwards. A test
+	// that truncates the log needs the frames of the log.
+	ReclaimInterval int64 `json:"reclaimInterval"`
 	// Synchronous is the synchronous pragma of the primary database: OFF,
 	// NORMAL or FULL.
 	Synchronous string `json:"synchronous"`
@@ -343,6 +352,23 @@ func (r *relay) segmentFiles() []string {
 	return out
 }
 
+// truncateWAL cuts the tail of the write-ahead log of the primary database.
+//
+// The frames of the log are lost: the primary database lost the transactions
+// that were committed at the end of the log.
+func truncateWAL(t *testing.T, path string) error {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	size := int64(wal.HeaderSize + 16)
+	if info.Size() < size {
+		size = info.Size()
+	}
+	return os.Truncate(path, size)
+}
+
 // do sends a command to a process and returns the payload of the answer.
 //
 // A command that failed is an error: the message of the failure holds the
@@ -533,11 +559,15 @@ func runPrimary() {
 	if set.Synchronous != "" {
 		dsn += "&_synchronous=" + set.Synchronous
 	}
+	reclaimInterval := time.Duration(set.ReclaimInterval) * time.Second
+	if reclaimInterval <= 0 {
+		reclaimInterval = 20 * time.Millisecond
+	}
 	drv, err := driver.Open(ctx, driver.Config{
 		DSN:             dsn,
 		ScanInterval:    20 * time.Millisecond,
 		ReclaimBytes:    1 << 20,
-		ReclaimInterval: 20 * time.Millisecond,
+		ReclaimInterval: reclaimInterval,
 		ReclaimTimeout:  10 * time.Second,
 	})
 	if err != nil {
@@ -1111,14 +1141,40 @@ func waitFor(timeout time.Duration, cond func() bool) bool {
 //
 // The condition has to hold for a moment: the capture of the source runs
 // after the commit of the business, a sample may be taken before the last
-// transaction reached the spool.
+// transaction reached the spool. The source must not capture anything during
+// that moment: a transaction that is committed but not captured yet is
+// missing on the backup.
+//
+// The source has to capture the whole log before the two sides are in line:
+// the transactions that are still in the log are not on the backup. The
+// statistics of the source are a snapshot: a capture round that runs while
+// the source writes into the spool is not visible in them.
+//
+// The source holds the transactions that did not fit into the spool in its
+// memory: they are not durable and the backup does not have them yet. The
+// source reports the spool as full while it holds them.
 func (r *relay) waitCatchUp() {
 	r.t.Helper()
 	since := time.Time{}
+	seq := uint64(0)
+	frame := uint64(0)
 	if !waitFor(catchUpTimeout, func() bool {
 		src := r.sourceStats()
 		bck := r.backupStats()
-		if src.CapturedSeq != bck.AppliedSeq || src.BackupSeq != src.CapturedSeq {
+		if src.CapturedSeq != bck.AppliedSeq || src.BackupSeq != src.CapturedSeq || src.SpoolFull {
+			since = time.Time{}
+			return false
+		}
+		if src.Driver.CaptureCursor.Frame < uint64(src.Driver.WALFrames) {
+			// The source did not capture the whole log yet.
+			since = time.Time{}
+			return false
+		}
+		if src.CapturedSeq != seq || src.Driver.CaptureCursor.Frame != frame {
+			// The source captured more: the backup has to apply it before
+			// the two sides are in line.
+			seq = src.CapturedSeq
+			frame = src.Driver.CaptureCursor.Frame
 			since = time.Time{}
 			return false
 		}
@@ -1130,8 +1186,8 @@ func (r *relay) waitCatchUp() {
 	}) {
 		src := r.sourceStats()
 		bck := r.backupStats()
-		r.t.Fatalf("the backup did not catch up: the source captured %d, the backup applied %d, the source holds the acknowledgement %d",
-			src.CapturedSeq, bck.AppliedSeq, src.BackupSeq)
+		r.t.Fatalf("the backup did not catch up: the source captured %d, the backup applied %d, the source holds the acknowledgement %d, the spool is full: %t",
+			src.CapturedSeq, bck.AppliedSeq, src.BackupSeq, src.SpoolFull)
 	}
 }
 
@@ -1185,17 +1241,40 @@ func (r *relay) queryBackup(query string) rows {
 // database and on the database of the backup and the rows are compared one
 // by one. The bytes of the two files are not the same: the backup rewrites
 // the header of the first page.
+//
+// A mismatch reports the state of the relay: the sequence numbers of the two
+// sides and the epoch of the chain say where the chain stopped.
 func (r *relay) compare() {
 	r.t.Helper()
 	for _, query := range []string{queryAccounts, queryEntries, querySchema} {
 		want := r.queryPrimary(query)
 		got := r.queryBackup(query)
 		if !reflect.DeepEqual(want, got) {
-			r.t.Errorf("the backup does not hold the rows of the primary database for the query %q:\nprimary: %v\nbackup:  %v",
-				query, want.Rows, got.Rows)
+			r.t.Errorf("the backup does not hold the rows of the primary database for the query %q:\nprimary: %v\nbackup:  %v\nstate:%s",
+				query, want.Rows, got.Rows, r.state())
 		}
 	}
 	r.checkIntegrity()
+}
+
+// state returns the statistics of the two sides of the relay.
+//
+// The state is best effort: a process that is gone has no statistics.
+func (r *relay) state() string {
+	var b strings.Builder
+	b.WriteString("\n  source: ")
+	if out, err := r.primary.do("stats"); err == nil {
+		b.WriteString(out)
+	} else {
+		b.WriteString(err.Error())
+	}
+	b.WriteString("\n  backup: ")
+	if out, err := r.backup.do("stats"); err == nil {
+		b.WriteString(out)
+	} else {
+		b.WriteString(err.Error())
+	}
+	return b.String()
 }
 
 // checkIntegrity checks the database of the backup.
